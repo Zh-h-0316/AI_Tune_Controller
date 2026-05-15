@@ -37,31 +37,35 @@ class LQR_car:
         self.B[1, 0] = 0.0           # affects e_y (directly 0)
 
 
-    def Update_Q_R_matrix(self, q11, q22, r00, r11, heading):
-        q1 = q11
-        q2 = q22
-        r = r00
-        if heading == 1:
-            v = abs(self.cur_state.v)
-            if 0.2 < v < 0.75:
-                q2 = 135; r = 70
-            elif 0.75 <= v < 1.2:
-                q2 = 115; r = 80
-            elif 1.2 <= v < 1.75:
-                q2 = 125; r = 80
-            elif 1.75 <= v < 2.0:
-                q2 = 120; r = 95
-            elif 2.0 <= v < 2.5:
-                q2 = 110; r = 120
-            elif 2.5 <= v < 3.0:
-                q2 = 95; r = 145
-            elif 3.0 <= v < 3.5:
-                q2 = 75; r = 175
-            elif v >= 3.5:
-                q2 = 60; r = 200
-        self.Q[0, 0] = q1
-        self.Q[1, 1] = q2
-        self.R[0, 0] = r
+    def Update_Q_R_matrix(self, q11, q22, r00, r11):
+        v = abs(self.cur_state.v)
+        if 0.0 < v < 0.75:
+            q22 = 135
+            r00 = 70
+        elif 0.75 <= v < 1.2:
+            q22 = 115
+            r00 = 80
+        elif 1.2 <= v < 1.75:
+            q22 = 125
+            r00 = 80
+        elif 1.75 <= v < 2.0:
+            q22 = 120
+            r00 = 95
+        elif 2.0 <= v < 2.5:
+            q22 = 110
+            r00 = 120
+        elif 2.5 <= v < 3.0:
+            q22 = 95
+            r00 = 145
+        elif 3.0 <= v < 3.5:
+            q22 = 75
+            r00 = 175
+        elif v >= 3.5:
+            q22 = 60
+            r00 = 200
+        self.Q[0, 0] = q11
+        self.Q[1, 1] = q22
+        self.R[0, 0] = r00
         self.R[1, 1] = r11
 
     def _solve_riccati(self, A, B, Q, R, M=None):

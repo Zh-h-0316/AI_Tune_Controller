@@ -1,0 +1,213 @@
+"""
+自适应MPC控制器 - 支持动态调整预测步长和权重
+包含一阶惯性环节补偿
+"""
+import cvxpy as cp
+import numpy as np
+from data_structures import State, Control, ReferencePoint, ErrorState
+from vehicle_model import VehicleModel, PathTracker
+import Config_Para as cfg
+
+class AdaptiveMPC:
+    """自适应MPC控制器（参数可由PPO调节）包含惯性环节补偿"""
+    
+    def __init__(self, N: int = cfg.MPC_DEFAULT_N, dt: float = cfg.VEHICLE_DT, 
+                 L: float = cfg.VEHICLE_L):
+        self.dt = dt
+        self.L = L
+        
+        # 惯性环节补偿
+        self.tau = cfg.STEERING_TAU
+        self.delay_compensation = cfg.STEERING_DELAY_STEPS
+        
+        # 初始参数（将被PPO覆盖）
+        self.N = N  # 预测步长
+        self.Q = np.diag([cfg.MPC_DEFAULT_Q_EY, cfg.MPC_DEFAULT_Q_EPSI])  # 状态权重
+        self.R = np.array([[cfg.MPC_DEFAULT_R_DELTA]])  # 控制权重
+        
+        # 控制约束
+        self.delta_min = cfg.MPC_DELTA_MIN
+        self.delta_max = cfg.MPC_DELTA_MAX
+        
+        # 状态和控制维度
+        self.NX = 2  # 状态维度: [e_y, e_psi]
+        self.NU = 1  # 控制维度: [delta_target]
+        
+        # 上一时刻控制量
+        self.last_control = Control(delta_target=0.0, delta_actual=0.0)
+        
+        # 实际转角估计
+        self.delta_actual_est = 0.0
+    
+    def update_parameters(self, N: int, Q_ey: float, Q_epsi: float, R_delta: float):
+        """更新MPC参数：预测步长、横向权重、航向权重、控制权重"""
+        # 限制参数范围
+        self.N = max(cfg.MPC_N_MIN, min(cfg.MPC_N_MAX, int(N)))
+        Q_ey = max(cfg.MPC_Q_MIN, min(cfg.MPC_Q_MAX, Q_ey))
+        Q_epsi = max(cfg.MPC_Q_MIN, min(cfg.MPC_Q_MAX, Q_epsi))
+        R_delta = max(cfg.MPC_R_MIN, min(cfg.MPC_R_MAX, R_delta))
+        
+        # 根据调整模式构建权重矩阵
+        if cfg.MPC_ADJUST_MODE == 'lateral_only':
+            # 仅调整横向权重，航向权重固定为默认值
+            self.Q = np.diag([Q_ey, cfg.MPC_DEFAULT_Q_EPSI])
+        elif cfg.MPC_ADJUST_MODE == 'heading_only':
+            # 仅调整航向权重，横向权重固定为默认值
+            self.Q = np.diag([cfg.MPC_DEFAULT_Q_EY, Q_epsi])
+        elif cfg.MPC_ADJUST_MODE == 'both':
+            # 同时调整横向和航向权重
+            self.Q = np.diag([Q_ey, Q_epsi])
+        else:  # 'none' or default
+            self.Q = np.diag([cfg.MPC_DEFAULT_Q_EY, cfg.MPC_DEFAULT_Q_EPSI])
+        
+        self.R = np.array([[R_delta]])
+    
+    def compensate_inertia(self, delta_target_prev: float, delta_target: float) -> float:
+        """补偿一阶惯性环节"""
+        # 预补偿：考虑惯性环节的延迟
+        a = np.exp(-self.dt / self.tau)
+        b = 1 - a
+        
+        # 估计下一时刻的实际转角
+        delta_actual_next = a * self.delta_actual_est + b * delta_target
+        
+        # 补偿控制量
+        delta_compensated = delta_target + (delta_target - delta_target_prev) * self.delay_compensation
+        
+        # 更新实际转角估计
+        self.delta_actual_est = delta_actual_next
+        
+        return delta_compensated
+    
+    def solve(self, vehicle: VehicleModel, tracker: PathTracker) -> Control:
+        """求解MPC问题（包含惯性补偿）"""
+        state = vehicle.state
+        
+        # 计算参考轨迹
+        x_ref, u_ref, psi_ref, _ = self.calc_ref_trajectory(state, tracker, self.N)
+        
+        # 当前误差状态
+        target_point = tracker.find_target_point(state)
+        current_error = vehicle.calc_errors(target_point)
+        x0 = np.array([current_error.e_y, current_error.e_psi])
+        
+        # 定义优化变量
+        x = cp.Variable((self.NX, self.N + 1))  # 状态变量
+        u = cp.Variable((self.NU, self.N))      # 控制变量（目标转角）
+        
+        # 构建目标函数和约束
+        cost = 0.0
+        constraints = []
+        
+        # 初始条件约束
+        constraints.append(x[:, 0] == x0)
+        
+        # 构建预测模型约束（考虑惯性环节）
+        for t in range(self.N):
+            # 获取参考前轮转角
+            ref_delta = u_ref[0, t]
+            ref_psi = psi_ref[t]
+            
+            # 获取线性化模型（包含惯性环节）
+            A, B = vehicle.get_error_model(ref_delta, ref_psi)
+            
+            # 动力学约束（考虑惯性补偿）
+            delta_eff = u[:, t]
+            if t > 0:
+                # 补偿惯性延迟
+                delta_prev = u[:, t-1]
+                delta_eff = delta_prev + (u[:, t] - delta_prev) * (1 + self.delay_compensation)
+            
+            constraints.append(x[:, t+1] == A @ x[:, t] + B @ (delta_eff - np.array([ref_delta])))
+            
+            # 控制约束
+            constraints.append(u[0, t] >= self.delta_min)
+            constraints.append(u[0, t] <= self.delta_max)
+            
+            # 控制变化率约束
+            if t > 0:
+                delta_rate = (u[0, t] - u[0, t-1]) / self.dt
+                constraints.append(delta_rate >= -0.5)  # 最大转向速度 -0.5 rad/s
+                constraints.append(delta_rate <= 0.5)   # 最大转向速度 0.5 rad/s
+            
+            # 目标函数
+            cost += cp.quad_form(x[:, t], self.Q)  # 状态误差代价
+            cost += cp.quad_form(u[:, t] - np.array([u_ref[0, t]]), self.R)  # 控制误差代价
+        
+        # 终端代价（增强终端约束）
+        cost += cp.quad_form(x[:, self.N], self.Q * 5.0)
+        
+        # 求解优化问题
+        prob = cp.Problem(cp.Minimize(cost), constraints)
+        
+        try:
+            prob.solve(solver=cp.ECOS, verbose=False, max_iters=200)
+            
+            if prob.status in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
+                if u.value is not None:
+                    delta_target_opt = float(u.value[0, 0])
+                    delta_target_opt = np.clip(delta_target_opt, self.delta_min, self.delta_max)
+                    
+                    # 补偿惯性环节
+                    delta_target_comp = self.compensate_inertia(
+                        self.last_control.delta_target, delta_target_opt
+                    )
+                    delta_target_comp = np.clip(delta_target_comp, self.delta_min, self.delta_max)
+                    
+                    # 添加随机扰动
+                    delta_noise = np.random.normal(0, cfg.NOISE_CONTROL_STD)
+                    delta_target_comp += delta_noise
+                    delta_target_comp = np.clip(delta_target_comp, self.delta_min, self.delta_max)
+                    
+                    # 创建控制命令（实际转角将由车辆模型计算）
+                    control = Control(delta_target=delta_target_comp, delta_actual=0.0)
+                    self.last_control = control
+                    
+                    return control
+                else:
+                    print("MPC求解失败: u.value为None")
+                    return self.last_control
+            else:
+                # 使用上一时刻控制量
+                print(f"MPC求解状态: {prob.status}")
+                return self.last_control
+                
+        except Exception as e:
+            print(f"MPC求解失败: {e}")
+            return self.last_control
+    
+    def calc_ref_trajectory(self, state: State, tracker: PathTracker, N: int):
+        """计算参考轨迹"""
+        nearest_idx, _ = tracker.find_nearest_point(state.x, state.y)
+        
+        x_ref = np.zeros((self.NX, N + 1))
+        u_ref = np.zeros((self.NU, N))
+        psi_ref = np.zeros(N + 1)
+        
+        for i in range(N + 1):
+            idx = min(nearest_idx + i, len(tracker.path) - 1)
+            ref_point = tracker.path[idx]
+            
+            x_ref[0, i] = 0.0
+            x_ref[1, i] = 0.0
+            psi_ref[i] = ref_point.psi
+            
+            if i < N:
+                u_ref[0, i] = np.arctan(self.L * ref_point.curvature)
+        
+        return x_ref, u_ref, psi_ref, nearest_idx
+    
+    def reset(self):
+        """重置控制器"""
+        self.last_control = Control(delta_target=0.0, delta_actual=0.0)
+        self.delta_actual_est = 0.0
+        
+    def get_parameters(self):
+        """获取当前MPC参数"""
+        return {
+            'N': self.N,
+            'Q_ey': self.Q[0, 0],
+            'Q_epsi': self.Q[1, 1],
+            'R_delta': self.R[0, 0],
+            'tau': self.tau
+        }

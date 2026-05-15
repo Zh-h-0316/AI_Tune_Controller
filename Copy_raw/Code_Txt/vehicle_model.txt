@@ -1,0 +1,264 @@
+"""
+车辆模型和路径跟踪器 - 包含一阶惯性环节
+"""
+import numpy as np
+from typing import List, Optional, Tuple
+from data_structures import State, Control, ReferencePoint, ErrorState, HistoryState
+from data_structures import normalize_angle, rotation_matrix, calculate_rate_filtered, moving_average_filter
+import Config_Para as cfg
+
+class VehicleModel:
+    """自行车运动学模型 - 包含转向惯性环节"""
+    
+    def __init__(self, state: Optional[State] = None, L: float = cfg.VEHICLE_L, 
+                 dt: float = cfg.VEHICLE_DT, v_ref: float = 2.0):
+        if state:
+            self.state = state
+        else:
+            self.state = State(v=v_ref)
+            
+        self.L = L  # 轴距
+        self.dt = dt  # 时间步长
+        self.v_ref = v_ref  # 参考速度
+        
+        # 惯性环节参数
+        self.tau = cfg.STEERING_TAU  # 惯性时间常数
+        self.delay_steps = cfg.STEERING_DELAY_STEPS  # 延迟步数
+        self.delta_buffer = []  # 转向角缓冲区
+        
+        # 历史状态
+        self.history: List[State] = []  # 历史状态
+        self.e_y_history: List[float] = []  # 横向偏差历史
+        self.e_psi_history: List[float] = []  # 航向偏差历史
+        
+        # 实际控制输入
+        self.delta_actual = 0.0  # 实际前轮转角
+        
+    def steering_inertia(self, delta_target: float) -> float:
+        """一阶惯性环节：目标转角 -> 实际转角"""
+        # 离散化一阶惯性环节: delta_actual(k) = a * delta_actual(k-1) + b * delta_target(k)
+        a = np.exp(-self.dt / self.tau)
+        b = 1 - a
+        
+        # 更新实际转角
+        self.delta_actual = a * self.delta_actual + b * delta_target
+        
+        # 添加延迟
+        self.delta_buffer.append(self.delta_actual)
+        if len(self.delta_buffer) > self.delay_steps:
+            delta_delayed = self.delta_buffer.pop(0)
+        else:
+            delta_delayed = 0.0  # 初始阶段
+        
+        return delta_delayed if self.delta_buffer else self.delta_actual
+    
+    def update(self, control: Control) -> State:
+        """更新车辆状态（使用实际转角）"""
+        # 通过惯性环节计算实际转角
+        delta_actual = self.steering_inertia(control.delta_target)
+        
+        # 添加随机扰动到实际控制输入
+        delta_with_noise = delta_actual + np.random.normal(0, cfg.NOISE_CONTROL_STD)
+        delta_with_noise = np.clip(delta_with_noise, cfg.MPC_DELTA_MIN, cfg.MPC_DELTA_MAX)
+        
+        # 自行车模型运动方程 - 使用实际转角
+        self.state.x += self.v_ref * np.cos(self.state.psi) * self.dt
+        self.state.y += self.v_ref * np.sin(self.state.psi) * self.dt
+        self.state.psi += self.v_ref / self.L * np.tan(delta_with_noise) * self.dt
+        self.state.psi = normalize_angle(self.state.psi)
+        
+        # 保持速度稳定在参考值附近
+        self.state.v = self.v_ref
+        self.state.delta_actual = delta_with_noise
+        
+        # 添加状态随机扰动
+        self.add_random_noise()
+        
+        # 保存历史状态
+        self.history.append(State(
+            self.state.x, self.state.y, 
+            self.state.psi, self.state.v,
+            self.state.delta_actual
+        ))
+        
+        # 更新实际控制值
+        control.delta_actual = delta_with_noise
+        
+        return self.state
+    
+    def add_random_noise(self):
+        """添加随机扰动"""
+        # 位置噪声
+        self.state.x += np.random.normal(0, cfg.NOISE_POSITION_STD)
+        self.state.y += np.random.normal(0, cfg.NOISE_POSITION_STD)
+        
+        # 航向噪声
+        psi_noise = np.random.normal(0, cfg.NOISE_HEADING_STD)
+        self.state.psi += psi_noise
+        self.state.psi = normalize_angle(self.state.psi)
+        
+        # 速度噪声
+        v_noise = np.random.normal(0, cfg.NOISE_VELOCITY_STD)
+        self.state.v = max(0.5, self.v_ref + v_noise)
+    
+    def get_error_model(self, ref_delta: float, ref_psi: float):
+        """获取误差模型（线性化模型）"""
+        # 考虑惯性环节的连续时间线性化状态矩阵
+        A_cont = np.array([
+            [0.0, self.v_ref],
+            [0.0, 0.0]
+        ])
+        
+        # 考虑惯性环节的连续时间线性化控制矩阵
+        B_cont = np.array([
+            [0.0],
+            [self.v_ref / (self.L * (1 + self.tau))]
+        ])
+        
+        # 离散化（使用欧拉法）
+        A = np.eye(2) + A_cont * self.dt
+        B = B_cont * self.dt
+        
+        return A, B
+    
+    def calc_errors(self, ref_point: ReferencePoint) -> ErrorState:
+        """计算当前状态与参考点的误差"""
+        # 将车辆坐标转换到路径坐标系
+        dx = self.state.x - ref_point.x
+        dy = self.state.y - ref_point.y
+        
+        # 路径坐标系的旋转矩阵
+        R = rotation_matrix(-ref_point.psi)
+        path_coords = R @ np.array([dx, dy])
+        
+        e_y = path_coords[1]  # 横向偏差
+        e_psi = normalize_angle(self.state.psi - ref_point.psi)  # 航向偏差
+        
+        # 更新历史误差
+        self.e_y_history.append(e_y)
+        self.e_psi_history.append(e_psi)
+        
+        # 限制历史长度
+        max_history = cfg.HISTORY_LENGTH + cfg.FILTER_WINDOW
+        if len(self.e_y_history) > max_history:
+            self.e_y_history.pop(0)
+            self.e_psi_history.pop(0)
+        
+        # 计算滤波后的变化率
+        e_y_rate = calculate_rate_filtered(self.e_y_history, cfg.FILTER_WINDOW, self.dt)
+        e_psi_rate = calculate_rate_filtered(self.e_psi_history, cfg.FILTER_WINDOW, self.dt)
+        
+        return ErrorState(e_y, e_psi, e_y_rate, e_psi_rate)
+    
+    def get_history_state(self) -> HistoryState:
+        """获取历史状态"""
+        # 获取最近的历史
+        e_y_recent = self.e_y_history[-cfg.HISTORY_LENGTH:] if len(self.e_y_history) >= cfg.HISTORY_LENGTH else self.e_y_history
+        e_psi_recent = self.e_psi_history[-cfg.HISTORY_LENGTH:] if len(self.e_psi_history) >= cfg.HISTORY_LENGTH else self.e_psi_history
+        
+        # 补零以保持固定长度
+        if len(e_y_recent) < cfg.HISTORY_LENGTH:
+            e_y_recent = [0.0] * (cfg.HISTORY_LENGTH - len(e_y_recent)) + e_y_recent
+            e_psi_recent = [0.0] * (cfg.HISTORY_LENGTH - len(e_psi_recent)) + e_psi_recent
+        
+        # 计算滤波后的变化率
+        e_y_rate_filtered = calculate_rate_filtered(self.e_y_history, cfg.FILTER_WINDOW, self.dt)
+        e_psi_rate_filtered = calculate_rate_filtered(self.e_psi_history, cfg.FILTER_WINDOW, self.dt)
+        
+        return HistoryState(
+            e_y_history=e_y_recent,
+            e_psi_history=e_psi_recent,
+            e_y_rate_filtered=e_y_rate_filtered,
+            e_psi_rate_filtered=e_psi_rate_filtered,
+            v=self.state.v,
+            L=self.L
+        )
+    
+    def reset(self, state: Optional[State] = None, v_ref: Optional[float] = None) -> None:
+        """重置车辆状态"""
+        if state:
+            self.state = state
+        else:
+            # 随机选择速度
+            if v_ref is None:
+                # 在0.1~8.0m/s范围内随机选择，步长0.1
+                v_options = np.arange(cfg.VEHICLE_V_MIN, cfg.VEHICLE_V_MAX + cfg.VEHICLE_V_STEP, cfg.VEHICLE_V_STEP)
+                self.v_ref = np.random.choice(v_options)
+            else:
+                self.v_ref = v_ref
+            
+            self.state = State(v=self.v_ref)
+        
+        # 重置历史
+        self.history = []
+        self.e_y_history = []
+        self.e_psi_history = []
+        self.delta_buffer = []
+        self.delta_actual = 0.0
+
+class PathTracker:
+    """路径跟踪器基类"""
+    
+    def __init__(self, lookahead_distance: float = 5.0):
+        self.lookahead_distance = lookahead_distance
+        self.path: List[ReferencePoint] = []
+        self.current_target_idx = 0
+    
+    def set_path(self, path: List[ReferencePoint]) -> None:
+        """设置跟踪路径"""
+        self.path = path
+        self.current_target_idx = 0
+    
+    def find_target_point(self, vehicle_state: State) -> ReferencePoint:
+        """寻找目标点"""
+        if not self.path:
+            return ReferencePoint()
+        
+        # 寻找最近点
+        min_dist = float('inf')
+        nearest_idx = 0
+        
+        for i in range(len(self.path)):
+            dx = vehicle_state.x - self.path[i].x
+            dy = vehicle_state.y - self.path[i].y
+            dist = np.sqrt(dx**2 + dy**2)
+            
+            if dist < min_dist:
+                min_dist = dist
+                nearest_idx = i
+        
+        # 基于预瞄距离寻找目标点
+        target_idx = nearest_idx
+        accumulated_dist = 0.0
+        
+        for i in range(nearest_idx, len(self.path) - 1):
+            if accumulated_dist >= self.lookahead_distance:
+                break
+                
+            dx = self.path[i+1].x - self.path[i].x
+            dy = self.path[i+1].y - self.path[i].y
+            segment_dist = np.sqrt(dx**2 + dy**2)
+            accumulated_dist += segment_dist
+            target_idx = i + 1
+        
+        self.current_target_idx = target_idx
+        return self.path[target_idx]
+    
+    def find_nearest_point(self, x: float, y: float) -> Tuple[int, float]:
+        """寻找最近路径点"""
+        if not self.path:
+            return 0, 0.0
+        
+        min_dist = float('inf')
+        nearest_idx = 0
+        
+        for i in range(len(self.path)):
+            dx = x - self.path[i].x
+            dy = y - self.path[i].y
+            dist = np.sqrt(dx**2 + dy**2)
+            
+            if dist < min_dist:
+                min_dist = dist
+                nearest_idx = i
+        
+        return nearest_idx, min_dist

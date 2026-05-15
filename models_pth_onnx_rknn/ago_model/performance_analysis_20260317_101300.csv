@@ -1,0 +1,2 @@
+﻿model_file,config_file,path_type,num_runs,lqr_mae_lateral,adaptive_mae_lateral,improvement_lateral,lqr_mae_heading,adaptive_mae_heading,improvement_heading,better_lateral_count,better_heading_count,conclusion
+adaptive_net_20260316_222630.pth,config_20260316_222630.pt,straight,1,0.005773140073791462,0.003981608045088687,0.0017915320287027747,0.002542846685604602,0.002034127919209094,0.0005087187663955078,1,1,综合判断：Adaptive LQR 在横向与航向误差两项上整体优于 Pure LQR，建议优先使用。

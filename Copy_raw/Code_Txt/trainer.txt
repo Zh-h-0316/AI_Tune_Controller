@@ -1,0 +1,530 @@
+"""
+训练和测试函数 - 使用Stable-Baselines3
+包含回调函数记录训练数据
+"""
+import torch
+import numpy as np
+import copy
+import time
+import os
+from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.monitor import Monitor
+from training_env import VehicleMPCEnv
+from ppo_agent import PPOAgent
+from data_structures import Control
+import Config_Para as cfg
+
+class TrainingCallback(BaseCallback):
+    """自定义训练回调函数，记录训练数据"""
+    
+    def __init__(self, verbose=0):
+        super().__init__(verbose)
+        self.episode_rewards = []
+        self.episode_errors = []
+        self.episode_params = []
+        self.episode_velocities = []
+        
+        self.current_episode_reward = 0.0
+        self.current_episode_errors = []
+        self.current_episode_params = []
+        self.current_episode_steps = 0
+        
+    def _on_step(self) -> bool:
+        """每一步调用"""
+        # 获取当前环境信息
+        infos = self.locals.get('infos', [])
+        if infos:
+            info = infos[0]  # 假设只有一个环境
+            
+            # 累加奖励
+            rewards = self.locals.get('rewards', [0.0])
+            self.current_episode_reward += rewards[0] if rewards else 0.0
+            
+            # 记录误差和参数
+            if 'lateral_error' in info:
+                self.current_episode_errors.append(info['lateral_error'])
+            
+            if 'mpc_params' in info:
+                self.current_episode_params.append(info['mpc_params'])
+            
+            self.current_episode_steps += 1
+            
+            # 检查episode是否结束
+            dones = self.locals.get('dones', [False])
+            if dones and dones[0]:
+                # episode结束，记录数据
+                mean_error = np.mean(self.current_episode_errors) if self.current_episode_errors else 0.0
+                
+                # 计算平均参数
+                if self.current_episode_params:
+                    avg_params = {
+                        'N': np.mean([p['N'] for p in self.current_episode_params]),
+                        'Q_ey': np.mean([p['Q_ey'] for p in self.current_episode_params]),
+                        'Q_epsi': np.mean([p['Q_epsi'] for p in self.current_episode_params]),
+                        'R_delta': np.mean([p['R_delta'] for p in self.current_episode_params])
+                    }
+                else:
+                    avg_params = {
+                        'N': cfg.MPC_DEFAULT_N, 
+                        'Q_ey': cfg.MPC_DEFAULT_Q_EY,
+                        'Q_epsi': cfg.MPC_DEFAULT_Q_EPSI,
+                        'R_delta': cfg.MPC_DEFAULT_R_DELTA
+                    }
+                
+                # 记录速度
+                v_ref = info.get('v_ref', 0.0)
+                
+                # 添加到历史
+                self.episode_rewards.append(self.current_episode_reward)
+                self.episode_errors.append(mean_error)
+                self.episode_params.append(avg_params)
+                self.episode_velocities.append(v_ref)
+                
+                # 重置当前episode数据
+                self.current_episode_reward = 0.0
+                self.current_episode_errors = []
+                self.current_episode_params = []
+                self.current_episode_steps = 0
+        
+        return True
+    
+    def _on_rollout_end(self) -> None:
+        """每个rollout结束时调用"""
+        if self.verbose > 0 and len(self.episode_rewards) > 0:
+            latest_reward = self.episode_rewards[-1]
+            latest_error = self.episode_errors[-1] if len(self.episode_errors) > 0 else 0.0
+            print(f"  最新episode - 奖励: {latest_reward:.2f}, 平均误差: {latest_error:.4f}m")
+    
+    def get_training_data(self):
+        """获取训练数据"""
+        return {
+            'episode_rewards': self.episode_rewards,
+            'episode_errors': self.episode_errors,
+            'episode_params': self.episode_params,
+            'episode_velocities': self.episode_velocities
+        }
+
+def train_ppo_mpc_sb3(path_type='sine', total_timesteps=100000, 
+                      num_envs=1, adjust_mode=None, use_inertia_in_prediction=True, **kwargs):
+    """使用Stable-Baselines3训练PPO-MPC控制器"""
+    print("开始训练PPO-MPC路径跟踪控制器（Stable-Baselines3 LSTM版本）...")
+    print(f"路径类型: {path_type}, 总时间步: {total_timesteps}")
+    
+    # 保存原始调整模式
+    original_mode = cfg.MPC_ADJUST_MODE
+    
+    # 如果指定了调整模式，临时修改配置
+    if adjust_mode is not None:
+        cfg.MPC_ADJUST_MODE = adjust_mode
+    
+    print(f"调整模式: {cfg.MPC_ADJUST_MODE}")
+    print("="*50)
+    
+    # 创建日志目录
+    log_dir = f"./logs/ppo_mpc_{path_type}_{cfg.MPC_ADJUST_MODE}/"
+    os.makedirs(log_dir, exist_ok=True)
+    
+    # 创建环境
+    def make_env():
+        env = VehicleMPCEnv(path_type=path_type)
+        env = Monitor(env, log_dir)  # 包装Monitor以记录奖励
+        return env
+    
+    if num_envs > 1:
+        # 多环境并行训练
+        env = DummyVecEnv([make_env for _ in range(num_envs)])
+    else:
+        # 单环境训练
+        env = DummyVecEnv([make_env])
+    
+    # 获取设备
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"使用设备: {device}")
+    
+    # 自定义PPO参数
+    ppo_kwargs = {
+        'learning_rate': cfg.PPO_LEARNING_RATE,
+        'n_steps': cfg.TRAIN_MAX_STEPS,
+        'batch_size': cfg.TRAIN_BATCH_SIZE,  # 现在为50，是200的因数
+        'n_epochs': cfg.TRAIN_UPDATE_EPOCHS,
+        'gamma': cfg.PPO_GAMMA,
+        'gae_lambda': cfg.PPO_GAE_LAMBDA,
+        'clip_range': cfg.PPO_CLIP_EPSILON,
+        'ent_coef': cfg.PPO_ENTROPY_COEF,
+        'vf_coef': cfg.PPO_VALUE_COEF,
+        'max_grad_norm': cfg.PPO_MAX_GRAD_NORM,
+        'verbose': 1,
+        'tensorboard_log': log_dir
+    }
+    
+    ppo_kwargs.update(kwargs)
+    
+    # 确保device参数被正确设置
+    ppo_kwargs['device'] = device
+    
+    # 策略网络参数 - 修正为字典格式
+    policy_kwargs = dict(
+        net_arch=dict(
+            pi=[cfg.PPO_HIDDEN_DIM//2, cfg.PPO_HIDDEN_DIM//4],
+            vf=[cfg.PPO_HIDDEN_DIM//2, cfg.PPO_HIDDEN_DIM//4]
+        ),
+        activation_fn=torch.nn.Tanh
+    )
+    
+    # 创建PPO智能体
+    agent = PPOAgent(env, policy_kwargs=policy_kwargs, **ppo_kwargs)
+    
+    # 训练回调
+    callback = TrainingCallback(verbose=1)
+    
+    # 训练模型
+    print(f"\n开始训练，总时间步: {total_timesteps}")
+    print(f"TensorBoard日志路径: {log_dir}")
+    print("="*50)
+    
+    start_time = time.time()
+    agent.train(total_timesteps=total_timesteps, callback=callback)
+    training_time = time.time() - start_time
+    
+    # 恢复原始调整模式
+    if adjust_mode is not None:
+        cfg.MPC_ADJUST_MODE = original_mode
+    
+    print("="*50)
+    print("训练完成!")
+    print(f"训练时间: {training_time:.2f}秒")
+    print(f"平均时间步/秒: {total_timesteps/training_time:.1f}")
+    
+    # 获取训练数据
+    training_data = callback.get_training_data()
+    
+    # 创建best_policy_state（保持接口一致）
+    best_policy_state = None
+    if training_data['episode_rewards']:
+        best_idx = np.argmax(training_data['episode_rewards'])
+        best_policy_state = {
+            'policy_net': copy.deepcopy(agent.model.policy.state_dict()),
+            'episode': best_idx + 1,
+            'reward': training_data['episode_rewards'][best_idx],
+            'mean_error': training_data['episode_errors'][best_idx] if best_idx < len(training_data['episode_errors']) else 0.0,
+            'avg_params': training_data['episode_params'][best_idx] if best_idx < len(training_data['episode_params']) else {},
+            'v_ref': training_data['episode_velocities'][best_idx] if best_idx < len(training_data['episode_velocities']) else 0.0
+        }
+        print(f"最佳策略来自第 {best_idx+1} 轮，奖励: {training_data['episode_rewards'][best_idx]:.2f}")
+    
+    return agent, training_data['episode_rewards'], training_data['episode_errors'], \
+           training_data['episode_params'], training_data['episode_velocities'], best_policy_state
+
+def test_ppo_mpc_sb3(agent, path_type='sine', num_test=5, deterministic=True,
+                    adjust_mode=None, use_inertia_in_prediction=True):
+    """测试训练好的PPO-MPC控制器"""
+    print(f"\n测试PPO-MPC在{path_type}路径上的性能...")
+    
+    # 保存原始调整模式
+    original_mode = cfg.MPC_ADJUST_MODE
+    
+    # 如果指定了调整模式，临时修改配置
+    if adjust_mode is not None:
+        cfg.MPC_ADJUST_MODE = adjust_mode
+    
+    print(f"调整模式: {cfg.MPC_ADJUST_MODE}")
+    print("="*50)
+    
+    test_results = []
+    
+    for test_idx in range(num_test):
+        env = VehicleMPCEnv(path_type=path_type)
+        obs, info = env.reset(seed=test_idx)
+        
+        # 记录测试数据
+        states = []
+        controls = []
+        errors = []
+        params_history = []
+        
+        done = False
+        step = 0
+        total_reward = 0.0
+        
+        print(f"测试 {test_idx+1}/{num_test}...", end='', flush=True)
+        
+        while not done and step < 500:
+            # 使用训练好的策略选择动作
+            action = agent.predict(obs, deterministic=deterministic)
+            
+            # 执行动作
+            obs, reward, done, truncated, info = env.step(action)
+            
+            # 记录数据
+            states.append(env.vehicle.state)
+            controls.append(Control(
+                delta_target=info['control_target'],
+                delta_actual=info['control_actual']
+            ))
+            errors.append(info['lateral_error'])
+            params_history.append(info['mpc_params'])
+            
+            total_reward += reward
+            step += 1
+            done = done or truncated
+        
+        print(f"完成，步数: {step}")
+        
+        # 计算测试结果
+        mean_error = np.mean(errors) if errors else 0.0
+        max_error = np.max(errors) if errors else 0.0
+        
+        # 计算平均参数
+        if params_history:
+            avg_params = {
+                'N': np.mean([p['N'] for p in params_history]),
+                'Q_ey': np.mean([p['Q_ey'] for p in params_history]),
+                'Q_epsi': np.mean([p['Q_epsi'] for p in params_history]),
+                'R_delta': np.mean([p['R_delta'] for p in params_history])
+            }
+        else:
+            avg_params = {
+                'N': cfg.MPC_DEFAULT_N, 
+                'Q_ey': cfg.MPC_DEFAULT_Q_EY,
+                'Q_epsi': cfg.MPC_DEFAULT_Q_EPSI,
+                'R_delta': cfg.MPC_DEFAULT_R_DELTA
+            }
+        
+        test_results.append({
+            'test_idx': test_idx,
+            'mean_error': mean_error,
+            'max_error': max_error,
+            'steps': step,
+            'total_reward': total_reward,
+            'states': states,
+            'controls': controls,
+            'errors': errors,
+            'params_history': params_history,
+            'avg_params': avg_params,
+            'v_ref': info.get('v_ref', 0.0)
+        })
+    
+    # 恢复原始调整模式
+    if adjust_mode is not None:
+        cfg.MPC_ADJUST_MODE = original_mode
+    
+    return test_results
+
+# 为了保持向后兼容性，重命名函数
+train_ppo_mpc = train_ppo_mpc_sb3
+test_ppo_mpc = test_ppo_mpc_sb3
+
+def evaluate_policy(agent, path_type='sine', num_episodes=5, max_steps=200, deterministic=True):
+    """评估策略的性能"""
+    env = VehicleMPCEnv(path_type=path_type)
+    
+    total_reward = 0.0
+    total_error = 0.0
+    results = []
+    
+    for test_idx in range(num_episodes):
+        obs, info = env.reset(seed=test_idx)
+        
+        episode_reward = 0.0
+        episode_errors = []
+        
+        for step in range(max_steps):
+            action = agent.predict(obs, deterministic=deterministic)
+            obs, reward, done, truncated, info = env.step(action)
+            
+            episode_reward += reward
+            episode_errors.append(info['lateral_error'])
+            
+            if done or truncated:
+                break
+        
+        mean_error = np.mean(episode_errors) if episode_errors else 0.0
+        results.append({
+            'episode': test_idx + 1,
+            'reward': episode_reward,
+            'mean_error': mean_error,
+            'max_error': np.max(episode_errors) if episode_errors else 0.0,
+            'v_ref': info.get('v_ref', 0.0)
+        })
+        
+        total_reward += episode_reward
+        total_error += mean_error
+    
+    avg_reward = total_reward / num_episodes
+    avg_error = total_error / num_episodes
+    
+    print(f"评估结果 ({num_episodes} 轮):")
+    print(f"  平均奖励: {avg_reward:.2f}")
+    print(f"  平均误差: {avg_error:.4f}m")
+    
+    return {
+        'avg_reward': avg_reward,
+        'avg_error': avg_error,
+        'detailed_results': results
+    }
+
+def compare_fixed_vs_adaptive_sb3(path_type='sine', num_tests=5):
+    """对比固定参数MPC和自适应MPC，记录状态轨迹和参数历史"""
+    print(f"\n对比固定参数MPC和自适应MPC在{path_type}路径上的性能...")
+    print("="*50)
+    
+    # 固定参数MPC参数
+    fixed_N = cfg.MPC_DEFAULT_N
+    fixed_Q_ey = cfg.MPC_DEFAULT_Q_EY
+    fixed_Q_epsi = cfg.MPC_DEFAULT_Q_EPSI
+    fixed_R_delta = cfg.MPC_DEFAULT_R_DELTA
+    
+    # 运行对比测试
+    fixed_results = []
+    adaptive_results = []
+    
+    # 需要先有一个训练好的自适应MPC模型
+    # 如果没有，我们可以训练一个简单的模型或使用随机策略
+    print("注意: 需要一个训练好的自适应MPC模型进行对比")
+    print("如果没有，将使用随机策略作为自适应MPC")
+    
+    use_pretrained = input("是否使用预训练模型? (y/n): ").strip().lower()
+    
+    if use_pretrained == 'y':
+        # 加载预训练模型
+        model_name = f"ppo_mpc_sb3_{path_type}.zip"
+        try:
+            from stable_baselines3 import PPO
+            adaptive_model = PPO.load(model_name, device='cpu')
+            
+            class AdaptiveAgent:
+                def __init__(self, model):
+                    self.model = model
+                
+                def predict(self, obs, deterministic=True):
+                    action, _ = self.model.predict(obs, deterministic=deterministic)
+                    return action
+            
+            adaptive_agent = AdaptiveAgent(adaptive_model)
+            print(f"✅ 已加载预训练模型: {model_name}")
+            
+        except FileNotFoundError:
+            print(f"❌ 未找到预训练模型: {model_name}")
+            print("将使用随机策略")
+            adaptive_agent = None
+    else:
+        adaptive_agent = None
+    
+    for test_idx in range(num_tests):
+        print(f"测试 {test_idx+1}/{num_tests}")
+        
+        # 固定参数MPC测试
+        env_fixed = VehicleMPCEnv(path_type=path_type)
+        obs, info = env_fixed.reset(seed=test_idx)
+        
+        fixed_states = []
+        fixed_errors = []
+        fixed_controls = []
+        fixed_params_history = []
+        done = False
+        step = 0
+        
+        while not done and step < 300:
+            # 固定参数 - 使用固定参数
+            action = [0, 0, 0]  # 对应默认参数
+            obs, _, done, truncated, info = env_fixed.step(action)
+            
+            # 记录状态
+            fixed_states.append(copy.deepcopy(env_fixed.vehicle.state))
+            fixed_errors.append(info['lateral_error'])
+            fixed_controls.append(Control(
+                delta_target=info['control_target'],
+                delta_actual=info['control_actual']
+            ))
+            
+            # 记录参数历史 - 对于固定MPC，使用默认参数
+            fixed_params_history.append({
+                'N': fixed_N,
+                'Q_ey': fixed_Q_ey,
+                'Q_epsi': fixed_Q_epsi,
+                'R_delta': fixed_R_delta
+            })
+            
+            step += 1
+            done = done or truncated
+        
+        fixed_results.append({
+            'states': fixed_states,
+            'mean_error': np.mean(fixed_errors),
+            'max_error': np.max(fixed_errors),
+            'steps': step,
+            'errors': fixed_errors,
+            'controls': fixed_controls,
+            'params_history': fixed_params_history,
+            'v_ref': info.get('v_ref', 0.0)
+        })
+        
+        # 自适应MPC测试
+        env_adaptive = VehicleMPCEnv(path_type=path_type)
+        obs, info = env_adaptive.reset(seed=test_idx)
+        
+        adaptive_states = []
+        adaptive_errors = []
+        adaptive_controls = []
+        adaptive_params_history = []
+        done = False
+        step = 0
+        
+        while not done and step < 300:
+            # 使用自适应策略
+            if adaptive_agent:
+                action = adaptive_agent.predict(obs, deterministic=True)
+            else:
+                # 随机策略 - 生成随机参数
+                N_norm = np.random.uniform(-1, 1)
+                Q_ey_norm = np.random.uniform(-1, 1)
+                R_delta_norm = np.random.uniform(-1, 1)
+                action = [N_norm, Q_ey_norm, R_delta_norm]
+            
+            obs, _, done, truncated, info = env_adaptive.step(action)
+            
+            # 记录状态
+            adaptive_states.append(copy.deepcopy(env_adaptive.vehicle.state))
+            adaptive_errors.append(info['lateral_error'])
+            adaptive_controls.append(Control(
+                delta_target=info['control_target'],
+                delta_actual=info['control_actual']
+            ))
+            
+            # 记录参数历史 - 从info中获取MPC参数
+            if 'mpc_params' in info:
+                mpc_params = info['mpc_params']
+                adaptive_params_history.append({
+                    'N': mpc_params.get('N', cfg.MPC_DEFAULT_N),
+                    'Q_ey': mpc_params.get('Q_ey', cfg.MPC_DEFAULT_Q_EY),
+                    'Q_epsi': mpc_params.get('Q_epsi', cfg.MPC_DEFAULT_Q_EPSI),
+                    'R_delta': mpc_params.get('R_delta', cfg.MPC_DEFAULT_R_DELTA)
+                })
+            else:
+                # 如果没有参数信息，使用默认值
+                adaptive_params_history.append({
+                    'N': cfg.MPC_DEFAULT_N,
+                    'Q_ey': cfg.MPC_DEFAULT_Q_EY,
+                    'Q_epsi': cfg.MPC_DEFAULT_Q_EPSI,
+                    'R_delta': cfg.MPC_DEFAULT_R_DELTA
+                })
+            
+            step += 1
+            done = done or truncated
+        
+        adaptive_results.append({
+            'states': adaptive_states,
+            'mean_error': np.mean(adaptive_errors),
+            'max_error': np.max(adaptive_errors),
+            'steps': step,
+            'errors': adaptive_errors,
+            'controls': adaptive_controls,
+            'params_history': adaptive_params_history,
+            'v_ref': info.get('v_ref', 0.0)
+        })
+    
+    return fixed_results, adaptive_results
+
+# 保持函数名兼容
+compare_fixed_vs_adaptive = compare_fixed_vs_adaptive_sb3

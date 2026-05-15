@@ -46,6 +46,7 @@ class VehicleModel:
         self.state.psi = normalize_angle(self.state.psi)
         self.state.v = self.v_ref
         self.state.delta_actual = delta_with_noise
+        self.state.omega = self.state.v / self.L * np.tan(delta_with_noise)
 
         # 添加观测噪声（高斯噪声）
         n_pos_std = cfg.NOISE_POSITION_LIMIT / 3.0
@@ -64,7 +65,14 @@ class VehicleModel:
         self.state.v = max(0.5, self.v_ref + n_v)
 
         self.history.append(State(
-            self.state.x, self.state.y, self.state.psi, self.state.v, self.state.delta_actual
+            self.state.x,
+            self.state.y,
+            self.state.psi,
+            self.state.v,
+            self.state.delta_actual,
+            self.state.roll,
+            self.state.pitch,
+            self.state.omega,
         ))
         control.delta_actual = delta_with_noise
         return State(
@@ -72,7 +80,10 @@ class VehicleModel:
             y=self.state.y,
             psi=self.state.psi,
             v=self.state.v,
-            delta_actual=self.state.delta_actual
+            delta_actual=self.state.delta_actual,
+            roll=self.state.roll,
+            pitch=self.state.pitch,
+            omega=self.state.omega,
         )
 
 

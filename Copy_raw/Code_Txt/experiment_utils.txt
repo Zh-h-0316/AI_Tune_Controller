@@ -1,0 +1,288 @@
+"""
+实验工具函数 - 用于管理和分析不同MPC参数调整模式的实验
+简化版本，主要用于特定调整模式的实验
+"""
+import numpy as np
+import matplotlib.pyplot as plt
+import pickle
+import os
+from datetime import datetime
+import Config_Para as cfg
+
+def run_single_mode_experiment(path_type='sine', adjust_mode='both', 
+                              total_timesteps=50000, num_tests=5):
+    """
+    运行单一调整模式的实验
+    """
+    from trainer import train_ppo_mpc_sb3, test_ppo_mpc_sb3
+    
+    print(f"开始单一调整模式实验")
+    print(f"路径类型: {path_type}")
+    print(f"调整模式: {adjust_mode}")
+    print(f"总训练步数: {total_timesteps}")
+    print(f"测试次数: {num_tests}")
+    print("="*70)
+    
+    # 保存原始调整模式
+    original_mode = cfg.MPC_ADJUST_MODE
+    
+    try:
+        # 设置调整模式
+        cfg.MPC_ADJUST_MODE = adjust_mode
+        
+        # 训练模型
+        agent, rewards, errors, params, velocities, best_state = train_ppo_mpc_sb3(
+            path_type=path_type,
+            total_timesteps=total_timesteps,
+            num_envs=1
+        )
+        
+        # 测试模型
+        test_results = test_ppo_mpc_sb3(
+            agent, 
+            path_type=path_type, 
+            num_test=num_tests
+        )
+        
+        # 准备实验结果
+        experiment_result = {
+            'training_rewards': rewards,
+            'training_errors': errors,
+            'training_params': params,
+            'test_results': test_results,
+            'best_state': best_state,
+            'adjust_mode': adjust_mode,
+            'path_type': path_type
+        }
+        
+        print(f"实验完成，平均奖励: {np.mean(rewards):.2f}")
+        
+        return experiment_result
+        
+    except Exception as e:
+        print(f"实验失败: {e}")
+        return {'error': str(e)}
+    finally:
+        # 恢复原始调整模式
+        cfg.MPC_ADJUST_MODE = original_mode
+
+def analyze_single_mode_result(experiment_result):
+    """分析单一模式实验结果"""
+    print("\n实验分析结果:")
+    print("="*70)
+    
+    if 'error' in experiment_result:
+        print(f"实验失败: {experiment_result['error']}")
+        return
+    
+    adjust_mode = experiment_result.get('adjust_mode', 'unknown')
+    path_type = experiment_result.get('path_type', 'unknown')
+    
+    # 提取数据
+    rewards = experiment_result.get('training_rewards', [])
+    errors = experiment_result.get('training_errors', [])
+    test_results = experiment_result.get('test_results', [])
+    
+    if not rewards or not test_results:
+        print("没有有效的实验数据")
+        return
+    
+    # 计算统计信息
+    avg_reward = np.mean(rewards[-10:]) if len(rewards) >= 10 else np.mean(rewards)
+    avg_error = np.mean(errors[-10:]) if len(errors) >= 10 else np.mean(errors)
+    
+    test_errors = [r['mean_error'] for r in test_results if 'mean_error' in r]
+    avg_test_error = np.mean(test_errors) if test_errors else 0.0
+    std_test_error = np.std(test_errors) if test_errors else 0.0
+    
+    # 获取平均参数
+    avg_params = {}
+    if test_results and 'avg_params' in test_results[0]:
+        avg_params = test_results[0]['avg_params']
+    
+    print(f"调整模式: {adjust_mode}")
+    print(f"路径类型: {path_type}")
+    print(f"训练平均奖励（最后10轮）: {avg_reward:.2f}")
+    print(f"训练平均误差（最后10轮）: {avg_error:.4f}m")
+    print(f"测试平均误差: {avg_test_error:.4f}m ± {std_test_error:.4f}m")
+    
+    if avg_params:
+        print(f"\n平均MPC参数:")
+        print(f"  预测步长 N: {avg_params.get('N', cfg.MPC_DEFAULT_N):.1f}")
+        print(f"  横向权重 Q_ey: {avg_params.get('Q_ey', cfg.MPC_DEFAULT_Q_EY):.2f}")
+        print(f"  航向权重 Q_epsi: {avg_params.get('Q_epsi', cfg.MPC_DEFAULT_Q_EPSI):.2f}")
+        print(f"  控制权重 R_delta: {avg_params.get('R_delta', cfg.MPC_DEFAULT_R_DELTA):.2f}")
+    
+    # 绘制训练结果
+    plot_single_mode_results(experiment_result)
+
+def plot_single_mode_results(experiment_result):
+    """绘制单一模式实验结果"""
+    adjust_mode = experiment_result.get('adjust_mode', 'unknown')
+    path_type = experiment_result.get('path_type', 'unknown')
+    
+    rewards = experiment_result.get('training_rewards', [])
+    errors = experiment_result.get('training_errors', [])
+    params_history = experiment_result.get('training_params', [])
+    test_results = experiment_result.get('test_results', [])
+    
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    
+    # 1. 训练奖励曲线
+    ax = axes[0, 0]
+    ax.plot(rewards, 'b-', linewidth=2, alpha=0.7)
+    ax.set_xlabel('训练轮次')
+    ax.set_ylabel('奖励')
+    ax.set_title(f'{adjust_mode}模式 - 训练奖励曲线')
+    ax.grid(True, alpha=0.3)
+    
+    # 使用移动平均平滑
+    if len(rewards) > 20:
+        window = min(20, len(rewards) // 10)
+        smoothed = np.convolve(rewards, np.ones(window)/window, mode='valid')
+        ax.plot(range(window-1, len(rewards)), smoothed, 'r-', linewidth=2, alpha=0.7, label=f'MA({window})')
+        ax.legend()
+    
+    # 2. 训练误差曲线
+    ax = axes[0, 1]
+    ax.plot(errors, 'g-', linewidth=2, alpha=0.7)
+    ax.set_xlabel('训练轮次')
+    ax.set_ylabel('平均横向误差 (m)')
+    ax.set_title(f'{adjust_mode}模式 - 训练误差曲线')
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim(bottom=0)
+    
+    # 3. 测试轨迹
+    ax = axes[0, 2]
+    if test_results and len(test_results) > 0:
+        test_result = test_results[0]
+        if 'states' in test_result and test_result['states']:
+            states = test_result['states']
+            x = [s.x for s in states]
+            y = [s.y for s in states]
+            ax.plot(x, y, 'b-', linewidth=2, alpha=0.7, label='车辆轨迹')
+            ax.set_xlabel('X位置 (m)')
+            ax.set_ylabel('Y位置 (m)')
+            ax.set_title(f'{adjust_mode}模式 - 测试轨迹')
+            ax.grid(True, alpha=0.3)
+            ax.axis('equal')
+    
+    # 4. 参数变化曲线
+    ax = axes[1, 0]
+    if params_history:
+        episodes = range(len(params_history))
+        
+        # 根据调整模式绘制相应的参数
+        if adjust_mode == 'both' or adjust_mode == 'lateral_only':
+            Q_ey_values = [p.get('Q_ey', cfg.MPC_DEFAULT_Q_EY) for p in params_history]
+            ax.plot(episodes, Q_ey_values, 'b-', linewidth=2, alpha=0.7, label='Q_ey (横向)')
+        
+        if adjust_mode == 'both' or adjust_mode == 'heading_only':
+            Q_epsi_values = [p.get('Q_epsi', cfg.MPC_DEFAULT_Q_EPSI) for p in params_history]
+            ax.plot(episodes, Q_epsi_values, 'g-', linewidth=2, alpha=0.7, label='Q_epsi (航向)')
+        
+        # 控制权重（总是绘制）
+        R_values = [p.get('R_delta', cfg.MPC_DEFAULT_R_DELTA) for p in params_history]
+        ax.plot(episodes, R_values, 'r-', linewidth=2, alpha=0.7, label='R_delta (控制)')
+        
+        ax.axhline(y=cfg.MPC_DEFAULT_Q_EY, color='b', linestyle='--', alpha=0.5, label='Q_ey默认值')
+        ax.axhline(y=cfg.MPC_DEFAULT_Q_EPSI, color='g', linestyle='--', alpha=0.5, label='Q_epsi默认值')
+        ax.axhline(y=cfg.MPC_DEFAULT_R_DELTA, color='r', linestyle='--', alpha=0.5, label='R_delta默认值')
+        
+        ax.set_xlabel('训练轮次')
+        ax.set_ylabel('参数值')
+        ax.set_title(f'{adjust_mode}模式 - 参数演化')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+    
+    # 5. 预测步长变化
+    ax = axes[1, 1]
+    if params_history:
+        N_values = [p.get('N', cfg.MPC_DEFAULT_N) for p in params_history]
+        ax.plot(episodes, N_values, 'm-', linewidth=2, alpha=0.7)
+        ax.axhline(y=cfg.MPC_DEFAULT_N, color='m', linestyle='--', alpha=0.5, label='N默认值')
+        ax.set_xlabel('训练轮次')
+        ax.set_ylabel('预测步长 N')
+        ax.set_title(f'{adjust_mode}模式 - 预测步长演化')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+    
+    # 6. 测试误差分布
+    ax = axes[1, 2]
+    if test_results:
+        test_errors = [r.get('mean_error', 0) for r in test_results]
+        test_indices = range(len(test_errors))
+        
+        ax.bar(test_indices, test_errors, alpha=0.7, color='orange')
+        ax.axhline(y=np.mean(test_errors), color='red', linestyle='--', linewidth=2, label='平均误差')
+        
+        ax.set_xlabel('测试编号')
+        ax.set_ylabel('平均横向误差 (m)')
+        ax.set_title(f'{adjust_mode}模式 - 测试误差分布')
+        ax.legend()
+        ax.grid(True, alpha=0.3, axis='y')
+    
+    plt.suptitle(f'{path_type}路径 - {adjust_mode}调整模式实验结果', fontsize=16, y=1.02)
+    plt.tight_layout()
+    plt.show()
+
+def save_experiment_result(experiment_result, filename=None):
+    """保存实验结果"""
+    if filename is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        adjust_mode = experiment_result.get('adjust_mode', 'unknown')
+        path_type = experiment_result.get('path_type', 'unknown')
+        filename = f"experiment_{path_type}_{adjust_mode}_{timestamp}.pkl"
+    
+    with open(filename, 'wb') as f:
+        pickle.dump(experiment_result, f)
+    
+    print(f"实验结果已保存为: {filename}")
+    return filename
+
+def load_experiment_result(filename):
+    """加载实验结果"""
+    with open(filename, 'rb') as f:
+        experiment_result = pickle.load(f)
+    
+    print(f"已加载实验结果: {filename}")
+    return experiment_result
+
+def compare_two_modes(path_type='sine', mode1='both', mode2='lateral_only', 
+                     total_timesteps=30000, num_tests=3):
+    """对比两种调整模式"""
+    print(f"对比两种调整模式: {mode1} vs {mode2}")
+    print(f"路径类型: {path_type}")
+    print("="*70)
+    
+    results = {}
+    
+    for mode in [mode1, mode2]:
+        print(f"\n运行模式: {mode}")
+        result = run_single_mode_experiment(
+            path_type=path_type,
+            adjust_mode=mode,
+            total_timesteps=total_timesteps,
+            num_tests=num_tests
+        )
+        
+        results[mode] = result
+    
+    # 分析对比结果
+    print("\n" + "="*70)
+    print("对比结果分析:")
+    print("="*70)
+    
+    for mode, result in results.items():
+        if 'error' in result:
+            print(f"{mode}模式: 实验失败 - {result['error']}")
+            continue
+        
+        test_results = result.get('test_results', [])
+        if test_results:
+            test_errors = [r.get('mean_error', 0) for r in test_results]
+            avg_error = np.mean(test_errors)
+            std_error = np.std(test_errors)
+            print(f"{mode}模式: 平均测试误差 = {avg_error:.4f}m ± {std_error:.4f}m")
+    
+    return results

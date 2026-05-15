@@ -9,6 +9,12 @@ VEHICLE_V_MAX = 8.0                   # 最大速度 (m/s)
 VEHICLE_V_STEP = 0.1                   # 速度步长 (m/s)
 VEHICLE_DT = 0.1                       # 仿真时间步长 (s)
 
+# ==================== Android对齐的LQR参数 ====================
+ANDROID_LQR_Q1 = 25.0                  # Android Car_delta.cpp 的基础 q1
+ANDROID_LQR_Q2 = 120.0                 # Android Car_delta.cpp 的基础 q2
+ANDROID_LQR_R = 80.0                   # Android Car_delta.cpp 的基础 r
+ANDROID_LQR_R11 = 0.01                 # Android Car_delta.cpp 的 r11
+
 # ==================== 转向系统参数 ====================
 STEERING_TAU = 0.1                     # 一阶惯性时间常数 (s)
 STEERING_LIMIT_MIN = -0.5236            # 最小转角 -30° (rad)
@@ -20,8 +26,8 @@ FILTER_WINDOW = 10                       # 滤波窗口长度
 
 # ==================== 路径参数 ====================
 PATH_STRAIGHT_LENGTH = 50.0              # 直线路径长度 (m)
-PATH_SINE_AMPLITUDE = 1.0                 # 正弦路径振幅 (m)
-PATH_SINE_FREQUENCY = 0.5                 # 正弦路径频率 (rad/m)
+PATH_SINE_AMPLITUDE = 0.5                 # 正弦路径振幅 (m)
+PATH_SINE_FREQUENCY = 0.2                 # 正弦路径频率 (rad/m)
 PATH_CIRCLE_RADIUS = 1.0                  # 圆形路径半径 (m)
 PATH_LANE_CHANGE_WIDTH = 0.5                # 换道路径宽度 (m)
 PATH_NUM_POINTS = 500                       # 路径点数

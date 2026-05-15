@@ -1,0 +1,305 @@
+"""
+主程序入口 - Stable-Baselines3版本
+"""
+import os
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+from training_env import VehicleMPCEnv
+from trainer import train_ppo_mpc, test_ppo_mpc, compare_fixed_vs_adaptive
+from visualizer import plot_training_results, plot_test_results, plot_comparison_results
+import Config_Para as cfg
+
+def main():
+    """主程序"""
+    print("PPO-自适应MPC车辆路径跟踪系统（Stable-Baselines3 LSTM版本）")
+    print("="*70)
+    print("系统特点:")
+    print("1. 使用Stable-Baselines3库的PPO算法")
+    print("2. 自定义LSTM网络处理历史状态序列（20个步长）")
+    print("3. PPO网络输入包含：历史横偏、历史航偏、当前横偏、当前航偏、滤波变化率、车速、轴距")
+    print("4. 车辆模型包含一阶惯性环节（目标转角->实际转角）")
+    print("5. 每条轨迹基准车速离散变化（0.1-8.0m/s，步长0.1m/s）")
+    print("6. 自适应调整MPC参数：预测步长、横向权重、航向权重、控制权重")
+    print("="*70)
+    
+    # 检查依赖
+    try:
+        from stable_baselines3 import PPO
+        print("✅ Stable-Baselines3 已安装")
+    except ImportError:
+        print("❌ Stable-Baselines3 未安装")
+        print("请运行: pip install stable-baselines3[extra]")
+        return
+    
+    # 选择运行模式
+    print("\n运行模式选择:")
+    print("1. 训练PPO-MPC控制器（SB3 LSTM）")
+    print("2. 测试训练好的控制器")
+    print("3. 对比固定参数MPC和自适应MPC")
+    print("4. 运行三种调整模式对比实验")
+    mode = input("请选择模式 (1-4): ").strip()
+    
+    if mode == '4':
+        # 运行三种调整模式对比实验
+        from experiment_adjust_modes import compare_three_adjustment_modes
+        compare_three_adjustment_modes()
+        return
+    
+    # 路径类型选择
+    print("\n路径类型选择:")
+    print("1. 直线路径 (straight)")
+    print("2. 正弦路径 (sine)")
+    print("3. 圆形路径 (circle)")
+    print("4. 换道路径 (lane_change)")
+    path_choice = input("请选择路径类型 (1-4): ").strip()
+    
+    path_types = ['straight', 'sine', 'circle', 'lane_change']
+    path_type = path_types[int(path_choice) - 1] if path_choice in ['1', '2', '3', '4'] else 'sine'
+    
+    # 调整模式选择
+    print("\nMPC参数调整模式选择:")
+    print("1. 同时调节横向和航向权重 (both)")
+    print("2. 仅调节横向权重 (lateral_only)")
+    print("3. 仅调节航向权重 (heading_only)")
+    print("4. 固定参数，不调节 (none)")
+    adjust_choice = input("请选择调整模式 (1-4): ").strip()
+    
+    adjust_modes = ['both', 'lateral_only', 'heading_only', 'none']
+    adjust_mode = adjust_modes[int(adjust_choice) - 1] if adjust_choice in ['1', '2', '3', '4'] else 'both'
+    
+    # 保存原始调整模式
+    original_mode = cfg.MPC_ADJUST_MODE
+    
+    # 设置新的调整模式
+    cfg.MPC_ADJUST_MODE = adjust_mode
+    
+    print(f"\n当前设置:")
+    print(f"路径类型: {path_type}")
+    print(f"调整模式: {adjust_mode}")
+    print("="*70)
+    
+    if mode == '1':
+        # 训练模式
+        print(f"\n训练 {path_type} 路径跟踪控制器")
+        print(f"调整模式: {adjust_mode}")
+        
+        # 获取训练参数
+        try:
+            total_timesteps = int(input("请输入总训练时间步数（推荐: 100000）: ").strip() or "100000")
+        except ValueError:
+            print("⚠️  输入无效，使用默认值 100000")
+            total_timesteps = 100000
+        
+        try:
+            num_envs = int(input("请输入并行环境数量（1-4，推荐: 1）: ").strip() or "1")
+            num_envs = max(1, min(4, num_envs))  # 限制在1-4之间
+        except ValueError:
+            print("⚠️  输入无效，使用默认值 1")
+            num_envs = 1
+        
+        # 训练
+        agent, rewards, errors, params, velocities, best_policy_state = train_ppo_mpc(
+            path_type=path_type,
+            total_timesteps=total_timesteps,
+            num_envs=num_envs
+        )
+        
+        # 绘制训练结果
+        plot_training_results(rewards, errors, params, velocities)
+        
+        # 保存模型
+        save_model = input("\n是否保存训练好的模型? (y/n): ").strip().lower()
+        if save_model == 'y':
+            model_name = f"ppo_mpc_sb3_{path_type}_{adjust_mode}"
+            
+            # 保存模型
+            agent.save(f"{model_name}.zip")
+            print(f"✅ 模型已保存为: {model_name}.zip")
+            
+            # 保存策略网络权重
+            save_weights = input("是否单独保存策略网络权重? (y/n): ").strip().lower()
+            if save_weights == 'y':
+                import torch
+                torch.save(agent.model.policy.state_dict(), f"{model_name}_weights.pth")
+                print(f"✅ 策略网络权重已保存为: {model_name}_weights.pth")
+                
+            # 保存配置
+            save_config = input("是否保存训练配置? (y/n): ").strip().lower()
+            if save_config == 'y':
+                import json
+                config = {
+                    'path_type': path_type,
+                    'total_timesteps': total_timesteps,
+                    'num_envs': num_envs,
+                    'adjust_mode': adjust_mode,
+                    'training_date': np.datetime64('now').astype(str)
+                }
+                with open(f"{model_name}_config.json", 'w') as f:
+                    json.dump(config, f, indent=2)
+                print(f"✅ 训练配置已保存为: {model_name}_config.json")
+    
+    elif mode == '2':
+        # 测试模式
+        # 加载训练好的模型
+        print("\n选择要测试的模型:")
+        print(f"1. 默认模型 (ppo_mpc_sb3_{path_type}_{adjust_mode}.zip)")
+        print("2. 自定义模型路径")
+        model_choice = input("请选择 (1 或 2): ").strip()
+        
+        if model_choice == '1':
+            model_name = f"ppo_mpc_sb3_{path_type}_{adjust_mode}.zip"
+        elif model_choice == '2':
+            model_name = input("请输入模型文件路径: ").strip()
+            if not model_name.endswith('.zip'):
+                print("⚠️  模型文件应为.zip格式")
+                model_name = f"ppo_mpc_sb3_{path_type}_{adjust_mode}.zip"
+        else:
+            print("⚠️  无效选择，默认使用标准模型")
+            model_name = f"ppo_mpc_sb3_{path_type}_{adjust_mode}.zip"
+        
+        try:
+            # 加载模型
+            from stable_baselines3 import PPO
+            
+            print(f"加载模型: {model_name}")
+            agent_model = PPO.load(model_name, device='cpu')
+            print("✅ 模型加载成功")
+            
+            # 创建包装类
+            class LoadedAgent:
+                def __init__(self, model):
+                    self.model = model
+                    self.policy_net = model.policy
+                
+                def predict(self, obs, deterministic=True):
+                    action, _ = self.model.predict(obs, deterministic=deterministic)
+                    return action
+                
+                def save(self, path):
+                    self.model.save(path)
+                
+                def load(self, path):
+                    self.model = PPO.load(path)
+                    self.policy_net = self.model.policy
+            
+            loaded_agent = LoadedAgent(agent_model)
+            
+            # 测试次数
+            try:
+                num_test = int(input("请输入测试次数（推荐: 3）: ").strip() or "3")
+            except ValueError:
+                print("⚠️  输入无效，使用默认值 3")
+                num_test = 3
+            
+            # 测试
+            test_results = test_ppo_mpc(loaded_agent, path_type=path_type, num_test=num_test)
+            
+            # 绘制测试结果
+            plot_test_results(test_results, path_type)
+            
+            # 保存测试结果
+            save_test = input("\n是否保存测试结果? (y/n): ").strip().lower()
+            if save_test == 'y':
+                import pickle
+                test_filename = f"test_results_{path_type}_{adjust_mode}_{np.datetime64('now').astype(str)[:19].replace(':', '-')}.pkl"
+                with open(test_filename, 'wb') as f:
+                    pickle.dump(test_results, f)
+                print(f"✅ 测试结果已保存为: {test_filename}")
+            
+        except FileNotFoundError:
+            print(f"❌ 未找到模型文件: {model_name}")
+            print("请先训练模型或检查文件路径")
+            print(f"当前目录: {os.getcwd()}")
+            
+            # 列出当前目录的模型文件
+            import glob
+            model_files = glob.glob("ppo_mpc_*.zip")
+            if model_files:
+                print("\n当前目录可用的模型文件:")
+                for f in model_files:
+                    print(f"  - {f}")
+            else:
+                print("当前目录没有找到模型文件")
+                
+        except Exception as e:
+            print(f"❌ 加载模型失败: {e}")
+            print("请确保模型格式正确")
+            import traceback
+            traceback.print_exc()
+    
+    elif mode == '3':
+        # 对比模式
+        try:
+            num_tests = int(input("请输入对比测试次数（推荐: 3）: ").strip() or "3")
+        except ValueError:
+            print("⚠️  输入无效，使用默认值 3")
+            num_tests = 3
+        
+        fixed_results, adaptive_results = compare_fixed_vs_adaptive(
+            path_type=path_type,
+            num_tests=num_tests
+        )
+        
+        # 绘制对比结果
+        plot_comparison_results(fixed_results, adaptive_results, path_type)
+        
+        # 保存对比结果
+        save_comparison = input("\n是否保存对比结果? (y/n): ").strip().lower()
+        if save_comparison == 'y':
+            import pickle
+            comparison_data = {
+                'fixed_results': fixed_results,
+                'adaptive_results': adaptive_results,
+                'path_type': path_type,
+                'adjust_mode': adjust_mode,
+                'test_date': np.datetime64('now').astype(str)
+            }
+            comparison_filename = f"comparison_results_{path_type}_{adjust_mode}_{np.datetime64('now').astype(str)[:19].replace(':', '-')}.pkl"
+            with open(comparison_filename, 'wb') as f:
+                pickle.dump(comparison_data, f)
+            print(f"✅ 对比结果已保存为: {comparison_filename}")
+    
+    else:
+        print("❌ 无效的模式选择")
+    
+    # 恢复原始调整模式
+    cfg.MPC_ADJUST_MODE = original_mode
+
+def check_dependencies():
+    """检查依赖包是否安装"""
+    required_packages = [
+        'stable_baselines3',
+        'torch',
+        'numpy',
+        'matplotlib',
+        'scipy',
+        'cvxpy',
+        'gymnasium'
+    ]
+    
+    missing_packages = []
+    for package in required_packages:
+        try:
+            __import__(package.replace('-', '_'))
+        except ImportError:
+            missing_packages.append(package)
+    
+    if missing_packages:
+        print("❌ 缺少依赖包:")
+        for package in missing_packages:
+            print(f"  - {package}")
+        print("\n请运行以下命令安装:")
+        print("pip install stable-baselines3[extra] torch numpy matplotlib scipy cvxpy gymnasium")
+        return False
+    
+    print("✅ 所有依赖包已安装")
+    return True
+
+if __name__ == "__main__":
+    # 检查依赖
+    if not check_dependencies():
+        exit(1)
+    
+    # 运行主程序
+    main()

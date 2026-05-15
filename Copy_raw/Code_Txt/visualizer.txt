@@ -1,0 +1,833 @@
+"""
+可视化函数 - 优化参数可视化，包含速度信息
+适配Stable-Baselines3版本
+"""
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib
+from matplotlib.ticker import AutoMinorLocator, MultipleLocator, FormatStrFormatter, FuncFormatter
+from data_structures import State, Control
+from path_generator import PathGenerator
+import Config_Para as cfg
+
+# 字体设置
+matplotlib.rcParams['font.sans-serif'] = ['DejaVu Sans', 'Arial', 'Helvetica']
+matplotlib.rcParams['axes.unicode_minus'] = False
+
+def plot_training_results(episode_rewards, episode_errors, episode_params, episode_velocities):
+    """绘制训练结果（适配SB3格式）"""
+    # 检查数据是否为空（SB3可能返回空列表）
+    if not episode_rewards or len(episode_rewards) == 0:
+        print("⚠️  训练数据为空")
+        print("   使用Stable-Baselines3训练时，请查看TensorBoard日志：")
+        print("   训练日志路径：./logs/ppo_mpc_{path_type}/")
+        print("   使用命令：tensorboard --logdir ./logs/")
+        return
+    
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    
+    # 1. 奖励曲线
+    ax = axes[0, 0]
+    ax.plot(episode_rewards, 'b-', linewidth=cfg.VIS_LINE_WIDTH, alpha=cfg.VIS_ALPHA, label='Reward')
+    ax.set_xlabel('Episode')
+    ax.set_ylabel('Total Reward')
+    ax.set_title('Training Reward Curve')
+    ax.grid(True, alpha=0.3)
+    
+    # 使用移动平均平滑奖励曲线
+    if len(episode_rewards) > 50:
+        window = min(50, len(episode_rewards) // 10)
+        smoothed_rewards = np.convolve(episode_rewards, np.ones(window)/window, mode='valid')
+        ax.plot(range(window-1, len(episode_rewards)), smoothed_rewards, 'r-', 
+                linewidth=cfg.VIS_LINE_WIDTH, label=f'MA({window})')
+        ax.legend()
+    
+    # 2. 误差曲线
+    ax = axes[0, 1]
+    if episode_errors and len(episode_errors) > 0:
+        ax.plot(episode_errors, 'g-', linewidth=cfg.VIS_LINE_WIDTH, alpha=cfg.VIS_ALPHA)
+    ax.set_xlabel('Episode')
+    ax.set_ylabel('Mean Lateral Error (m)')
+    ax.set_title('Training Error Curve')
+    ax.grid(True, alpha=0.3)
+    ax.set_ylim(bottom=0)
+    
+    # 3. 速度变化
+    ax = axes[0, 2]
+    if episode_velocities and len(episode_velocities) > 0:
+        ax.plot(episode_velocities, 'm-', linewidth=cfg.VIS_LINE_WIDTH, alpha=cfg.VIS_ALPHA)
+        ax.set_ylim([cfg.VEHICLE_V_MIN, cfg.VEHICLE_V_MAX])
+    else:
+        ax.text(0.5, 0.5, 'No velocity data', 
+               horizontalalignment='center', verticalalignment='center', 
+               transform=ax.transAxes, fontsize=12)
+    ax.set_xlabel('Episode')
+    ax.set_ylabel('Speed (m/s)')
+    ax.set_title('Training Speed Variation')
+    ax.grid(True, alpha=0.3)
+    
+    # 4. 预测步长N变化
+    ax = axes[1, 0]
+    if episode_params and len(episode_params) > 0:
+        N_values = [p['N'] for p in episode_params]
+        episodes = range(len(episode_params))
+        ax.plot(episodes, N_values, 'b-', linewidth=cfg.VIS_LINE_WIDTH, alpha=cfg.VIS_ALPHA)
+        ax.axhline(y=cfg.MPC_DEFAULT_N, color='b', linestyle='--', alpha=0.5, label='Default')
+        ax.set_xlabel('Episode')
+        ax.set_ylabel('Prediction Horizon N')
+        ax.set_title('Prediction Horizon Evolution')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+    else:
+        ax.text(0.5, 0.5, 'No parameter data', 
+               horizontalalignment='center', verticalalignment='center', 
+               transform=ax.transAxes, fontsize=12)
+        ax.set_title('Prediction Horizon Evolution')
+        ax.grid(True, alpha=0.3)
+    
+    # 5. 横向权重Q变化
+    ax = axes[1, 1]
+    if episode_params and len(episode_params) > 0:
+        Q_ey_values = [p['Q_ey'] for p in episode_params]
+        Q_epsi_values = [p.get('Q_epsi', cfg.MPC_DEFAULT_Q_EPSI) for p in episode_params]
+        episodes = range(len(episode_params))
+        
+        if cfg.MPC_ADJUST_MODE == 'both' or cfg.MPC_ADJUST_MODE == 'lateral_only':
+            ax.plot(episodes, Q_ey_values, 'g-', linewidth=cfg.VIS_LINE_WIDTH, alpha=cfg.VIS_ALPHA, label='Q_ey')
+        if cfg.MPC_ADJUST_MODE == 'both' or cfg.MPC_ADJUST_MODE == 'heading_only':
+            ax.plot(episodes, Q_epsi_values, 'c-', linewidth=cfg.VIS_LINE_WIDTH, alpha=cfg.VIS_ALPHA, label='Q_epsi')
+        
+        ax.axhline(y=cfg.MPC_DEFAULT_Q_EY, color='g', linestyle='--', alpha=0.5, label='Q_ey Default')
+        ax.axhline(y=cfg.MPC_DEFAULT_Q_EPSI, color='c', linestyle='--', alpha=0.5, label='Q_epsi Default')
+        
+        ax.set_xlabel('Episode')
+        ax.set_ylabel('Weight Value')
+        ax.set_title('Weight Evolution')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+    else:
+        ax.text(0.5, 0.5, 'No parameter data', 
+               horizontalalignment='center', verticalalignment='center', 
+               transform=ax.transAxes, fontsize=12)
+        ax.set_title('Weight Evolution')
+        ax.grid(True, alpha=0.3)
+    
+    # 6. 控制权重R变化
+    ax = axes[1, 2]
+    if episode_params and len(episode_params) > 0:
+        R_values = [p['R_delta'] for p in episode_params]
+        ax.plot(episodes, R_values, 'r-', linewidth=cfg.VIS_LINE_WIDTH, alpha=cfg.VIS_ALPHA)
+        ax.axhline(y=cfg.MPC_DEFAULT_R_DELTA, color='r', linestyle='--', alpha=0.5, label='Default')
+        ax.set_xlabel('Episode')
+        ax.set_ylabel('Control Weight R_delta')
+        ax.set_title('Control Weight Evolution')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+    else:
+        ax.text(0.5, 0.5, 'No parameter data', 
+               horizontalalignment='center', verticalalignment='center', 
+               transform=ax.transAxes, fontsize=12)
+        ax.set_title('Control Weight Evolution')
+        ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # 打印统计信息（如果数据可用）
+    print("\n训练统计信息:")
+    print("="*60)
+    
+    if episode_rewards and len(episode_rewards) > 0:
+        print(f"总训练轮次: {len(episode_rewards)}")
+        print(f"平均奖励: {np.mean(episode_rewards):.2f} ± {np.std(episode_rewards):.2f}")
+        print(f"最佳奖励: {np.max(episode_rewards):.2f}")
+    
+    if episode_errors and len(episode_errors) > 0:
+        print(f"平均误差: {np.mean(episode_errors):.4f}m ± {np.std(episode_errors):.4f}m")
+        print(f"最小误差: {np.min(episode_errors):.4f}m")
+    
+    if episode_velocities and len(episode_velocities) > 0:
+        print(f"速度范围: {np.min(episode_velocities):.1f} ~ {np.max(episode_velocities):.1f} m/s")
+    
+    # 打印最终参数
+    if episode_params and len(episode_params) > 0:
+        final_params = episode_params[-1]
+        print(f"\n最终MPC参数:")
+        print(f"  预测步长 N: {final_params['N']:.1f}")
+        print(f"  横向权重 Q_ey: {final_params['Q_ey']:.4f}")
+        print(f"  航向权重 Q_epsi: {final_params.get('Q_epsi', cfg.MPC_DEFAULT_Q_EPSI):.4f}")
+        print(f"  控制权重 R_delta: {final_params['R_delta']:.4f}")
+
+def plot_test_results(test_results, path_type='sine'):
+    """绘制测试结果（包含参数和速度信息）"""
+    if not test_results or len(test_results) == 0:
+        print("⚠️  测试结果为空")
+        return
+    
+    num_tests = len(test_results)
+    
+    fig, axes = plt.subplots(2, 3, figsize=(16, 10))
+    
+    # 1. 测试轨迹对比
+    ax = axes[0, 0]
+    
+    # 绘制参考路径
+    if path_type == 'straight':
+        path = PathGenerator.generate_straight_path()
+    elif path_type == 'sine':
+        path = PathGenerator.generate_sine_path()
+    elif path_type == 'circle':
+        path = PathGenerator.generate_circle_path()
+    elif path_type == 'lane_change':
+        path = PathGenerator.generate_lane_change_path()
+    else:
+        path = PathGenerator.generate_sine_path()
+    
+    path_points = np.array([[p.x, p.y] for p in path])
+    ax.plot(path_points[:, 0], path_points[:, 1], 'b--', linewidth=2, alpha=0.5, label='Reference Path')
+    
+    # 绘制每个测试的轨迹
+    colors = cfg.VIS_COLORS
+    for i, result in enumerate(test_results[:5]):
+        if 'states' in result and result['states']:
+            states = result['states']
+            traj_x = [s.x for s in states]
+            traj_y = [s.y for s in states]
+            v_ref = result.get('v_ref', 0.0)
+            ax.plot(traj_x, traj_y, colors[i%len(colors)]+'-', 
+                    linewidth=cfg.VIS_LINE_WIDTH, alpha=cfg.VIS_ALPHA, 
+                    label=f'Test {i+1} ({v_ref:.1f}m/s)')
+    
+    ax.set_xlabel('X Position (m)')
+    ax.set_ylabel('Y Position (m)')
+    ax.set_title(f'{path_type.title()} Path Tracking - Test Trajectories')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.axis('equal')
+    
+    # 2. 横向误差比较
+    ax = axes[0, 1]
+    for i, result in enumerate(test_results[:5]):
+        if 'errors' in result and result['errors']:
+            errors = result['errors']
+            steps = range(len(errors))
+            v_ref = result.get('v_ref', 0.0)
+            ax.plot(steps, errors, colors[i%len(colors)]+'-', 
+                    linewidth=cfg.VIS_LINE_WIDTH, alpha=cfg.VIS_ALPHA, 
+                    label=f'Test {i+1} ({v_ref:.1f}m/s)')
+    
+    ax.axhline(y=0, color='k', linestyle='--', alpha=0.3)
+    ax.set_xlabel('Step')
+    ax.set_ylabel('Lateral Error (m)')
+    ax.set_title('Lateral Error Comparison')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    # 3. 控制输入比较（目标 vs 实际）
+    ax = axes[0, 2]
+    if test_results and 'controls' in test_results[0] and test_results[0]['controls']:
+        result = test_results[0]
+        controls = result['controls']
+        steps = range(len(controls))
+        
+        target_angles = [np.rad2deg(c.delta_target) for c in controls]
+        actual_angles = [np.rad2deg(c.delta_actual) for c in controls]
+        
+        ax.plot(steps, target_angles, 'b-', linewidth=cfg.VIS_LINE_WIDTH, alpha=cfg.VIS_ALPHA, label='Target')
+        ax.plot(steps, actual_angles, 'r--', linewidth=cfg.VIS_LINE_WIDTH, alpha=cfg.VIS_ALPHA, label='Actual')
+        
+        ax.set_xlabel('Step')
+        ax.set_ylabel('Steering Angle (deg)')
+        ax.set_title('Control Input: Target vs Actual (Test 1)')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+    else:
+        ax.text(0.5, 0.5, 'No control data', 
+               horizontalalignment='center', verticalalignment='center', 
+               transform=ax.transAxes, fontsize=12)
+        ax.set_title('Control Input: Target vs Actual')
+        ax.grid(True, alpha=0.3)
+    
+    # 4. 预测步长N变化
+    ax = axes[1, 0]
+    if (test_results and test_results[0].get('params_history') and 
+        len(test_results[0]['params_history']) > 0):
+        params = test_results[0]['params_history']
+        steps = range(len(params))
+        N_values = [p['N'] for p in params]
+        ax.plot(steps, N_values, 'b-', linewidth=cfg.VIS_LINE_WIDTH, alpha=cfg.VIS_ALPHA)
+        ax.axhline(y=cfg.MPC_DEFAULT_N, color='b', linestyle='--', alpha=0.5, label='Default')
+        ax.set_xlabel('Step')
+        ax.set_ylabel('Prediction Horizon N')
+        ax.set_title('Prediction Horizon Adaptation (Test 1)')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+    else:
+        ax.text(0.5, 0.5, 'No parameter history', 
+               horizontalalignment='center', verticalalignment='center', 
+               transform=ax.transAxes, fontsize=12)
+        ax.set_title('Prediction Horizon Adaptation')
+        ax.grid(True, alpha=0.3)
+    
+    # 5. 权重参数变化
+    ax = axes[1, 1]
+    if (test_results and test_results[0].get('params_history') and 
+        len(test_results[0]['params_history']) > 0):
+        params = test_results[0]['params_history']
+        steps = range(len(params))
+        
+        Q_ey_values = [p['Q_ey'] for p in params]
+        Q_epsi_values = [p.get('Q_epsi', cfg.MPC_DEFAULT_Q_EPSI) for p in params]
+        
+        if cfg.MPC_ADJUST_MODE == 'both' or cfg.MPC_ADJUST_MODE == 'lateral_only':
+            ax.plot(steps, Q_ey_values, 'g-', linewidth=cfg.VIS_LINE_WIDTH, alpha=cfg.VIS_ALPHA, label='Q_ey')
+        if cfg.MPC_ADJUST_MODE == 'both' or cfg.MPC_ADJUST_MODE == 'heading_only':
+            ax.plot(steps, Q_epsi_values, 'c-', linewidth=cfg.VIS_LINE_WIDTH, alpha=cfg.VIS_ALPHA, label='Q_epsi')
+        
+        ax.axhline(y=cfg.MPC_DEFAULT_Q_EY, color='g', linestyle='--', alpha=0.5, label='Q_ey Default')
+        ax.axhline(y=cfg.MPC_DEFAULT_Q_EPSI, color='c', linestyle='--', alpha=0.5, label='Q_epsi Default')
+        
+        ax.set_xlabel('Step')
+        ax.set_ylabel('Weight Value')
+        ax.set_title('Weight Adaptation (Test 1)')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+    else:
+        ax.text(0.5, 0.5, 'No parameter history', 
+               horizontalalignment='center', verticalalignment='center', 
+               transform=ax.transAxes, fontsize=12)
+        ax.set_title('Weight Adaptation')
+        ax.grid(True, alpha=0.3)
+    
+    # 6. 控制权重R变化
+    ax = axes[1, 2]
+    if (test_results and test_results[0].get('params_history') and 
+        len(test_results[0]['params_history']) > 0):
+        R_values = [p['R_delta'] for p in params]
+        ax.plot(steps, R_values, 'r-', linewidth=cfg.VIS_LINE_WIDTH, alpha=cfg.VIS_ALPHA)
+        ax.axhline(y=cfg.MPC_DEFAULT_R_DELTA, color='r', linestyle='--', alpha=0.5, label='Default')
+        ax.set_xlabel('Step')
+        ax.set_ylabel('Control Weight R_delta')
+        ax.set_title('Control Weight Adaptation (Test 1)')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+    else:
+        ax.text(0.5, 0.5, 'No parameter history', 
+               horizontalalignment='center', verticalalignment='center', 
+               transform=ax.transAxes, fontsize=12)
+        ax.set_title('Control Weight Adaptation')
+        ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # 打印测试统计
+    print("\n测试结果统计:")
+    print("="*60)
+    for i, result in enumerate(test_results):
+        avg_params = result.get('avg_params', {})
+        v_ref = result.get('v_ref', 0.0)
+        
+        if 'mean_error' in result and 'max_error' in result:
+            print(f"测试 {i+1}: 速度={v_ref:.1f}m/s, 平均误差={result['mean_error']:.4f}m, "
+                  f"最大误差={result['max_error']:.4f}m, 步数={result.get('steps', 0)}")
+        
+        if avg_params:
+            print(f"       平均参数: N={avg_params.get('N', 0):.1f}, "
+                  f"Q_ey={avg_params.get('Q_ey', 0):.2f}, Q_epsi={avg_params.get('Q_epsi', 0):.2f}, "
+                  f"R={avg_params.get('R_delta', 0):.2f}")
+    
+    # 计算总体统计
+    mean_errors = [r.get('mean_error', 0) for r in test_results if 'mean_error' in r]
+    max_errors = [r.get('max_error', 0) for r in test_results if 'max_error' in r]
+    
+    if mean_errors:
+        print(f"\n总体统计:")
+        print(f"平均横向误差: {np.mean(mean_errors):.4f}m ± {np.std(mean_errors):.4f}m")
+        print(f"最大横向误差: {np.mean(max_errors):.4f}m ± {np.std(max_errors):.4f}m")
+
+def plot_comparison_results(fixed_results, adaptive_results, path_type='sine'):
+    """绘制对比结果，包括轨迹跟踪图"""
+    if not fixed_results or not adaptive_results:
+        print("⚠️  对比数据为空")
+        return
+    
+    num_tests = len(fixed_results)
+    
+    # 首先绘制轨迹跟踪对比图
+    plot_trajectory_comparison(fixed_results, adaptive_results, path_type)
+    
+    # 然后绘制误差对比图
+    plot_error_comparison(fixed_results, adaptive_results)
+    
+    # 绘制参数对比图
+    plot_parameter_comparison(fixed_results, adaptive_results, path_type)
+
+def plot_trajectory_comparison(fixed_results, adaptive_results, path_type='sine'):
+    """绘制轨迹跟踪对比图，优化纵轴刻度"""
+    num_tests = len(fixed_results)
+    
+    # 计算子图的行数和列数
+    n_cols = 2
+    n_rows = (num_tests + n_cols - 1) // n_cols
+    
+    # 生成参考路径
+    if path_type == 'straight':
+        path = PathGenerator.generate_straight_path()
+    elif path_type == 'sine':
+        path = PathGenerator.generate_sine_path()
+    elif path_type == 'circle':
+        path = PathGenerator.generate_circle_path()
+    elif path_type == 'lane_change':
+        path = PathGenerator.generate_lane_change_path()
+    else:
+        path = PathGenerator.generate_sine_path()
+    
+    path_points = np.array([[p.x, p.y] for p in path])
+    
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(15, 5*n_rows))
+    
+    # 如果只有一行，将axes转换为二维数组
+    if n_rows == 1:
+        axes = np.array([axes])
+    if n_cols == 1:
+        axes = axes.reshape(-1, 1)
+    
+    for test_idx in range(num_tests):
+        row = test_idx // n_cols
+        col = test_idx % n_cols
+        ax = axes[row, col]
+        
+        # 收集所有Y坐标数据以确定合理的刻度范围
+        all_y_data = []
+        
+        # 添加参考路径的Y坐标
+        all_y_data.extend(path_points[:, 1])
+        
+        # 绘制参考路径
+        ax.plot(path_points[:, 0], path_points[:, 1], 'k--', 
+                linewidth=2, alpha=0.5, label='Reference Path')
+        
+        # 绘制固定MPC轨迹
+        if test_idx < len(fixed_results) and 'states' in fixed_results[test_idx]:
+            fixed_states = fixed_results[test_idx]['states']
+            if fixed_states:
+                fixed_x = [s.x for s in fixed_states]
+                fixed_y = [s.y for s in fixed_states]
+                ax.plot(fixed_x, fixed_y, 'b-', linewidth=cfg.VIS_LINE_WIDTH, 
+                        alpha=cfg.VIS_ALPHA, label='Fixed MPC')
+                all_y_data.extend(fixed_y)
+                
+                # 绘制起点和终点
+                if fixed_states:
+                    ax.scatter(fixed_x[0], fixed_y[0], c='blue', s=100, marker='o', 
+                              label='Start (Fixed)')
+                    ax.scatter(fixed_x[-1], fixed_y[-1], c='blue', s=100, marker='*', 
+                              label='End (Fixed)')
+        
+        # 绘制自适应MPC轨迹
+        if test_idx < len(adaptive_results) and 'states' in adaptive_results[test_idx]:
+            adaptive_states = adaptive_results[test_idx]['states']
+            if adaptive_states:
+                adaptive_x = [s.x for s in adaptive_states]
+                adaptive_y = [s.y for s in adaptive_states]
+                ax.plot(adaptive_x, adaptive_y, 'r-', linewidth=cfg.VIS_LINE_WIDTH, 
+                        alpha=cfg.VIS_ALPHA, label='Adaptive MPC')
+                all_y_data.extend(adaptive_y)
+                
+                # 绘制起点和终点
+                if adaptive_states:
+                    ax.scatter(adaptive_x[0], adaptive_y[0], c='red', s=100, marker='o', 
+                              label='Start (Adaptive)')
+                    ax.scatter(adaptive_x[-1], adaptive_y[-1], c='red', s=100, marker='*', 
+                              label='End (Adaptive)')
+        
+        # 获取测试的额外信息
+        fixed_v_ref = fixed_results[test_idx].get('v_ref', 0.0) if test_idx < len(fixed_results) else 0.0
+        adaptive_v_ref = adaptive_results[test_idx].get('v_ref', 0.0) if test_idx < len(adaptive_results) else 0.0
+        
+        # 计算合理的Y轴刻度范围
+        if all_y_data:
+            y_min = min(all_y_data)
+            y_max = max(all_y_data)
+            y_range = y_max - y_min
+            
+            # 添加一些边距（5%）
+            margin = y_range * 0.05
+            y_min_adjusted = y_min - margin
+            y_max_adjusted = y_max + margin
+            
+            # 基于调整后的范围设置Y轴限制
+            ax.set_ylim([y_min_adjusted, y_max_adjusted])
+            
+            # 计算合理的刻度步长
+            if y_range > 0:
+                # 根据范围大小选择适当的步长
+                if y_range < 0.01:
+                    step = 0.001  # 非常小的范围
+                elif y_range < 0.1:
+                    step = 0.01
+                elif y_range < 0.5:
+                    step = 0.05
+                elif y_range < 1.0:
+                    step = 0.1
+                elif y_range < 5.0:
+                    step = 0.5
+                elif y_range < 20.0:
+                    step = 2.0
+                else:
+                    step = 5.0
+                
+                # 确保步长合理
+                if step > 0:
+                    # 设置主要刻度
+                    major_locator = MultipleLocator(step)
+                    ax.yaxis.set_major_locator(major_locator)
+                    
+                    # 设置次要刻度
+                    minor_locator = AutoMinorLocator(4)
+                    ax.yaxis.set_minor_locator(minor_locator)
+                    
+                    # 设置刻度标签格式，确保小数值能够显示
+                    if step < 0.01:
+                        ax.yaxis.set_major_formatter(FormatStrFormatter('%.3f'))
+                    elif step < 0.1:
+                        ax.yaxis.set_major_formatter(FormatStrFormatter('%.2f'))
+                    elif step < 1.0:
+                        ax.yaxis.set_major_formatter(FormatStrFormatter('%.1f'))
+        
+        # 设置X轴刻度
+        if path_points[:, 0].size > 0:
+            x_min = min(path_points[:, 0])
+            x_max = max(path_points[:, 0])
+            x_range = x_max - x_min
+            
+            if x_range > 0:
+                if x_range < 10:
+                    x_step = 1.0
+                elif x_range < 50:
+                    x_step = 5.0
+                elif x_range < 100:
+                    x_step = 10.0
+                else:
+                    x_step = 20.0
+                
+                # 设置X轴主要刻度
+                if x_step > 0:
+                    ax.xaxis.set_major_locator(MultipleLocator(x_step))
+                    ax.xaxis.set_minor_locator(AutoMinorLocator(4))
+        
+        # 添加图例和标题
+        ax.set_xlabel('X Position (m)')
+        ax.set_ylabel('Y Position (m)')
+        ax.set_title(f'Test {test_idx+1}: Fixed ({fixed_v_ref:.1f}m/s) vs Adaptive ({adaptive_v_ref:.1f}m/s)')
+        
+        # 简化图例以避免重复
+        if test_idx == 0:  # 只在第一个子图中显示完整图例
+            handles, labels = ax.get_legend_handles_labels()
+            # 去重
+            by_label = dict(zip(labels, handles))
+            ax.legend(by_label.values(), by_label.keys(), loc='upper right', fontsize=9)
+        else:
+            ax.legend(loc='upper right', fontsize=9)
+            
+        ax.grid(True, alpha=0.3, which='major')
+        ax.grid(True, alpha=0.15, which='minor', linestyle='--')
+        
+        # 尝试保持纵横比，但根据数据调整
+        if 'states' in fixed_results[test_idx] or 'states' in adaptive_results[test_idx]:
+            # 获取所有X坐标
+            all_x_data = []
+            if 'states' in fixed_results[test_idx] and fixed_results[test_idx]['states']:
+                all_x_data.extend([s.x for s in fixed_results[test_idx]['states']])
+            if 'states' in adaptive_results[test_idx] and adaptive_results[test_idx]['states']:
+                all_x_data.extend([s.x for s in adaptive_results[test_idx]['states']])
+            
+            if all_x_data:
+                x_range_actual = max(all_x_data) - min(all_x_data)
+                y_range_actual = max(all_y_data) - min(all_y_data)
+                
+                # 只有当范围不为零时才设置纵横比
+                if x_range_actual > 0 and y_range_actual > 0:
+                    ax.set_aspect('auto')  # 自动调整纵横比
+    
+    # 隐藏多余的子图
+    for i in range(num_tests, n_rows * n_cols):
+        row = i // n_cols
+        col = i % n_cols
+        axes[row, col].axis('off')
+    
+    plt.suptitle(f'{path_type.title()} Path Tracking: Fixed vs Adaptive MPC', fontsize=16, y=1.02)
+    plt.tight_layout()
+    plt.show()
+
+def plot_parameter_comparison(fixed_results, adaptive_results, path_type='sine'):
+    """绘制固定MPC和自适应MPC参数随位置变化对比图"""
+    num_tests = len(fixed_results)
+    
+    # 只绘制第一个测试的参数变化
+    test_idx = 0
+    
+    if test_idx >= len(fixed_results) or test_idx >= len(adaptive_results):
+        print("⚠️  没有足够的数据绘制参数对比图")
+        return
+    
+    # 获取固定MPC和自适应MPC的数据
+    fixed_data = fixed_results[test_idx]
+    adaptive_data = adaptive_results[test_idx]
+    
+    # 检查是否有状态和参数数据
+    if ('states' not in fixed_data or not fixed_data['states'] or 
+        'states' not in adaptive_data or not adaptive_data['states']):
+        print("⚠️  没有状态数据，无法绘制参数对比图")
+        return
+    
+    # 检查是否有参数历史数据
+    fixed_has_params = 'params_history' in fixed_data and fixed_data['params_history']
+    adaptive_has_params = 'params_history' in adaptive_data and adaptive_data['params_history']
+    
+    if not fixed_has_params and not adaptive_has_params:
+        print("⚠️  没有参数历史数据，无法绘制参数对比图")
+        return
+    
+    # 创建图形
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    
+    # 提取数据
+    fixed_states = fixed_data['states']
+    adaptive_states = adaptive_data['states']
+    
+    # 提取X位置
+    fixed_x = [s.x for s in fixed_states]
+    adaptive_x = [s.x for s in adaptive_states]
+    
+    # 1. 固定MPC参数变化
+    ax = axes[0, 0]
+    
+    # 默认固定参数
+    fixed_N = [cfg.MPC_DEFAULT_N] * len(fixed_x)
+    fixed_Q_ey = [cfg.MPC_DEFAULT_Q_EY] * len(fixed_x)
+    fixed_Q_epsi = [cfg.MPC_DEFAULT_Q_EPSI] * len(fixed_x)
+    fixed_R_delta = [cfg.MPC_DEFAULT_R_DELTA] * len(fixed_x)
+    
+    # 如果有实际参数历史，使用实际值
+    if fixed_has_params:
+        fixed_params = fixed_data['params_history']
+        # 确保参数历史长度与状态长度匹配
+        min_len = min(len(fixed_params), len(fixed_x))
+        fixed_x = fixed_x[:min_len]
+        fixed_N = [p.get('N', cfg.MPC_DEFAULT_N) for p in fixed_params[:min_len]]
+        fixed_Q_ey = [p.get('Q_ey', cfg.MPC_DEFAULT_Q_EY) for p in fixed_params[:min_len]]
+        fixed_Q_epsi = [p.get('Q_epsi', cfg.MPC_DEFAULT_Q_EPSI) for p in fixed_params[:min_len]]
+        fixed_R_delta = [p.get('R_delta', cfg.MPC_DEFAULT_R_DELTA) for p in fixed_params[:min_len]]
+    
+    # 绘制固定MPC参数
+    ax.plot(fixed_x, fixed_N, 'b-', label=f'Prediction Horizon N (Default: {cfg.MPC_DEFAULT_N})', 
+            linewidth=cfg.VIS_LINE_WIDTH, alpha=cfg.VIS_ALPHA)
+    ax.plot(fixed_x, fixed_Q_ey, 'g-', label=f'Lateral Weight Q_ey (Default: {cfg.MPC_DEFAULT_Q_EY})', 
+            linewidth=cfg.VIS_LINE_WIDTH, alpha=cfg.VIS_ALPHA)
+    ax.plot(fixed_x, fixed_Q_epsi, 'c-', label=f'Heading Weight Q_epsi (Default: {cfg.MPC_DEFAULT_Q_EPSI})', 
+            linewidth=cfg.VIS_LINE_WIDTH, alpha=cfg.VIS_ALPHA)
+    ax.plot(fixed_x, fixed_R_delta, 'r-', label=f'Control Weight R_delta (Default: {cfg.MPC_DEFAULT_R_DELTA})', 
+            linewidth=cfg.VIS_LINE_WIDTH, alpha=cfg.VIS_ALPHA)
+    
+    ax.set_xlabel('X Position (m)')
+    ax.set_ylabel('Parameter Value')
+    ax.set_title(f'Fixed MPC Parameters vs X Position (Test {test_idx+1})')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    # 设置Y轴刻度格式，确保小数值能够显示
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda x, p: format(x, '.2f')))
+    
+    # 2. 自适应MPC参数变化
+    ax = axes[0, 1]
+    
+    if adaptive_has_params:
+        adaptive_params = adaptive_data['params_history']
+        # 确保参数历史长度与状态长度匹配
+        min_len = min(len(adaptive_params), len(adaptive_x))
+        adaptive_x = adaptive_x[:min_len]
+        adaptive_N = [p.get('N', cfg.MPC_DEFAULT_N) for p in adaptive_params[:min_len]]
+        adaptive_Q_ey = [p.get('Q_ey', cfg.MPC_DEFAULT_Q_EY) for p in adaptive_params[:min_len]]
+        adaptive_Q_epsi = [p.get('Q_epsi', cfg.MPC_DEFAULT_Q_EPSI) for p in adaptive_params[:min_len]]
+        adaptive_R_delta = [p.get('R_delta', cfg.MPC_DEFAULT_R_DELTA) for p in adaptive_params[:min_len]]
+        
+        # 绘制自适应MPC参数
+        ax.plot(adaptive_x, adaptive_N, 'b-', label=f'Prediction Horizon N (Default: {cfg.MPC_DEFAULT_N})', 
+                linewidth=cfg.VIS_LINE_WIDTH, alpha=cfg.VIS_ALPHA)
+        ax.plot(adaptive_x, adaptive_Q_ey, 'g-', label=f'Lateral Weight Q_ey (Default: {cfg.MPC_DEFAULT_Q_EY})', 
+                linewidth=cfg.VIS_LINE_WIDTH, alpha=cfg.VIS_ALPHA)
+        ax.plot(adaptive_x, adaptive_Q_epsi, 'c-', label=f'Heading Weight Q_epsi (Default: {cfg.MPC_DEFAULT_Q_EPSI})', 
+                linewidth=cfg.VIS_LINE_WIDTH, alpha=cfg.VIS_ALPHA)
+        ax.plot(adaptive_x, adaptive_R_delta, 'r-', label=f'Control Weight R_delta (Default: {cfg.MPC_DEFAULT_R_DELTA})', 
+                linewidth=cfg.VIS_LINE_WIDTH, alpha=cfg.VIS_ALPHA)
+        
+        ax.set_xlabel('X Position (m)')
+        ax.set_ylabel('Parameter Value')
+        ax.set_title(f'Adaptive MPC Parameters vs X Position (Test {test_idx+1})')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        # 设置Y轴刻度格式，确保小数值能够显示
+        ax.yaxis.set_major_formatter(FuncFormatter(lambda x, p: format(x, '.2f')))
+    else:
+        ax.text(0.5, 0.5, 'No adaptive parameter data', 
+               horizontalalignment='center', verticalalignment='center', 
+               transform=ax.transAxes, fontsize=12)
+        ax.set_title('Adaptive MPC Parameters vs X Position')
+        ax.grid(True, alpha=0.3)
+    
+    # 3. 预测步长N对比
+    ax = axes[1, 0]
+    
+    # 确保数据长度一致
+    min_x_len = min(len(fixed_x), len(adaptive_x))
+    fixed_x_common = fixed_x[:min_x_len]
+    
+    if adaptive_has_params:
+        adaptive_N_common = adaptive_N[:min_x_len]
+        fixed_N_common = fixed_N[:min_x_len]
+        
+        ax.plot(fixed_x_common, fixed_N_common, 'b-', label='Fixed MPC', 
+                linewidth=cfg.VIS_LINE_WIDTH, alpha=cfg.VIS_ALPHA)
+        ax.plot(fixed_x_common, adaptive_N_common, 'r-', label='Adaptive MPC', 
+                linewidth=cfg.VIS_LINE_WIDTH, alpha=cfg.VIS_ALPHA)
+        ax.axhline(y=cfg.MPC_DEFAULT_N, color='k', linestyle='--', alpha=0.5, label='Default')
+        
+        ax.set_xlabel('X Position (m)')
+        ax.set_ylabel('Prediction Horizon N')
+        ax.set_title('Prediction Horizon Comparison: Fixed vs Adaptive')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+    else:
+        ax.text(0.5, 0.5, 'No adaptive parameter data', 
+               horizontalalignment='center', verticalalignment='center', 
+               transform=ax.transAxes, fontsize=12)
+        ax.set_title('Prediction Horizon Comparison: Fixed vs Adaptive')
+        ax.grid(True, alpha=0.3)
+    
+    # 4. 权重参数对比
+    ax = axes[1, 1]
+    
+    if adaptive_has_params:
+        adaptive_Q_ey_common = adaptive_Q_ey[:min_x_len]
+        adaptive_Q_epsi_common = adaptive_Q_epsi[:min_x_len]
+        fixed_Q_ey_common = fixed_Q_ey[:min_x_len]
+        fixed_Q_epsi_common = fixed_Q_epsi[:min_x_len]
+        
+        # 根据调整模式绘制相应的权重
+        if cfg.MPC_ADJUST_MODE == 'both' or cfg.MPC_ADJUST_MODE == 'lateral_only':
+            ax.plot(fixed_x_common, fixed_Q_ey_common, 'b-', label='Fixed MPC Q_ey', 
+                    linewidth=cfg.VIS_LINE_WIDTH, alpha=cfg.VIS_ALPHA)
+            ax.plot(fixed_x_common, adaptive_Q_ey_common, 'r-', label='Adaptive MPC Q_ey', 
+                    linewidth=cfg.VIS_LINE_WIDTH, alpha=cfg.VIS_ALPHA)
+            ax.axhline(y=cfg.MPC_DEFAULT_Q_EY, color='k', linestyle='--', alpha=0.5, label='Q_ey Default')
+        
+        if cfg.MPC_ADJUST_MODE == 'both' or cfg.MPC_ADJUST_MODE == 'heading_only':
+            ax.plot(fixed_x_common, fixed_Q_epsi_common, 'c-', label='Fixed MPC Q_epsi', 
+                    linewidth=cfg.VIS_LINE_WIDTH, alpha=cfg.VIS_ALPHA)
+            ax.plot(fixed_x_common, adaptive_Q_epsi_common, 'm-', label='Adaptive MPC Q_epsi', 
+                    linewidth=cfg.VIS_LINE_WIDTH, alpha=cfg.VIS_ALPHA)
+            ax.axhline(y=cfg.MPC_DEFAULT_Q_EPSI, color='k', linestyle='--', alpha=0.5, label='Q_epsi Default')
+        
+        ax.set_xlabel('X Position (m)')
+        ax.set_ylabel('Weight Value')
+        ax.set_title('Weight Comparison: Fixed vs Adaptive')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+    else:
+        ax.text(0.5, 0.5, 'No adaptive parameter data', 
+               horizontalalignment='center', verticalalignment='center', 
+               transform=ax.transAxes, fontsize=12)
+        ax.set_title('Weight Comparison: Fixed vs Adaptive')
+        ax.grid(True, alpha=0.3)
+    
+    plt.suptitle(f'MPC Parameter Comparison: Fixed vs Adaptive ({path_type.title()} Path)', fontsize=16, y=1.02)
+    plt.tight_layout()
+    plt.show()
+    
+    # 打印参数统计信息
+    print(f"\nMPC参数对比统计 (Test {test_idx+1}):")
+    print("="*60)
+    
+    if fixed_has_params:
+        print(f"固定MPC参数:")
+        print(f"  预测步长 N: 固定值 {cfg.MPC_DEFAULT_N}")
+        print(f"  横向权重 Q_ey: 固定值 {cfg.MPC_DEFAULT_Q_EY:.4f}")
+        print(f"  航向权重 Q_epsi: 固定值 {cfg.MPC_DEFAULT_Q_EPSI:.4f}")
+        print(f"  控制权重 R_delta: 固定值 {cfg.MPC_DEFAULT_R_DELTA:.4f}")
+    
+    if adaptive_has_params:
+        adaptive_params = adaptive_data['params_history']
+        if adaptive_params:
+            adaptive_N_values = [p.get('N', cfg.MPC_DEFAULT_N) for p in adaptive_params]
+            adaptive_Q_ey_values = [p.get('Q_ey', cfg.MPC_DEFAULT_Q_EY) for p in adaptive_params]
+            adaptive_Q_epsi_values = [p.get('Q_epsi', cfg.MPC_DEFAULT_Q_EPSI) for p in adaptive_params]
+            adaptive_R_delta_values = [p.get('R_delta', cfg.MPC_DEFAULT_R_DELTA) for p in adaptive_params]
+            
+            print(f"\n自适应MPC参数统计:")
+            print(f"  预测步长 N: {np.mean(adaptive_N_values):.1f} ± {np.std(adaptive_N_values):.1f} (范围: {np.min(adaptive_N_values):.1f} - {np.max(adaptive_N_values):.1f})")
+            print(f"  横向权重 Q_ey: {np.mean(adaptive_Q_ey_values):.4f} ± {np.std(adaptive_Q_ey_values):.4f} (范围: {np.min(adaptive_Q_ey_values):.4f} - {np.max(adaptive_Q_ey_values):.4f})")
+            print(f"  航向权重 Q_epsi: {np.mean(adaptive_Q_epsi_values):.4f} ± {np.std(adaptive_Q_epsi_values):.4f} (范围: {np.min(adaptive_Q_epsi_values):.4f} - {np.max(adaptive_Q_epsi_values):.4f})")
+            print(f"  控制权重 R_delta: {np.mean(adaptive_R_delta_values):.4f} ± {np.std(adaptive_R_delta_values):.4f} (范围: {np.min(adaptive_R_delta_values):.4f} - {np.max(adaptive_R_delta_values):.4f})")
+
+def plot_error_comparison(fixed_results, adaptive_results):
+    """绘制误差对比图"""
+    num_tests = len(fixed_results)
+    
+    fixed_mean_errors = [r.get('mean_error', 0) for r in fixed_results]
+    adaptive_mean_errors = [r.get('mean_error', 0) for r in adaptive_results]
+    
+    fixed_max_errors = [r.get('max_error', 0) for r in fixed_results]
+    adaptive_max_errors = [r.get('max_error', 0) for r in adaptive_results]
+    
+    improvement_mean = 0.0
+    if np.mean(fixed_mean_errors) > 0:
+        improvement_mean = (np.mean(fixed_mean_errors) - np.mean(adaptive_mean_errors)) / np.mean(fixed_mean_errors) * 100
+    
+    improvement_max = 0.0
+    if np.mean(fixed_max_errors) > 0:
+        improvement_max = (np.mean(fixed_max_errors) - np.mean(adaptive_max_errors)) / np.mean(fixed_max_errors) * 100
+    
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    
+    # 平均误差对比
+    ax = axes[0]
+    x = np.arange(num_tests)
+    width = 0.35
+    ax.bar(x - width/2, fixed_mean_errors, width, label='Fixed MPC', alpha=cfg.VIS_ALPHA)
+    ax.bar(x + width/2, adaptive_mean_errors, width, label='Adaptive MPC', alpha=cfg.VIS_ALPHA)
+    ax.set_xlabel('Test Index')
+    ax.set_ylabel('Mean Lateral Error (m)')
+    ax.set_title('Average Error Comparison')
+    ax.set_xticks(x)
+    ax.set_xticklabels([f'Test {i+1}' for i in range(num_tests)])
+    ax.legend()
+    ax.grid(True, alpha=0.3, axis='y')
+    
+    # 最大误差对比
+    ax = axes[1]
+    ax.bar(x - width/2, fixed_max_errors, width, label='Fixed MPC', alpha=cfg.VIS_ALPHA)
+    ax.bar(x + width/2, adaptive_max_errors, width, label='Adaptive MPC', alpha=cfg.VIS_ALPHA)
+    ax.set_xlabel('Test Index')
+    ax.set_ylabel('Max Lateral Error (m)')
+    ax.set_title('Maximum Error Comparison')
+    ax.set_xticks(x)
+    ax.set_xticklabels([f'Test {i+1}' for i in range(num_tests)])
+    ax.legend()
+    ax.grid(True, alpha=0.3, axis='y')
+    
+    plt.tight_layout()
+    plt.show()
+    
+    print("\n对比结果统计:")
+    print("="*60)
+    print(f"固定参数MPC平均误差: {np.mean(fixed_mean_errors):.4f}m ± {np.std(fixed_mean_errors):.4f}m")
+    print(f"自适应MPC平均误差: {np.mean(adaptive_mean_errors):.4f}m ± {np.std(adaptive_mean_errors):.4f}m")
+    if improvement_mean != 0:
+        print(f"平均误差性能提升: {improvement_mean:.1f}%")
+    print(f"\n固定参数MPC最大误差: {np.mean(fixed_max_errors):.4f}m ± {np.std(fixed_max_errors):.4f}m")
+    print(f"自适应MPC最大误差: {np.mean(adaptive_max_errors):.4f}m ± {np.std(adaptive_max_errors):.4f}m")
+    if improvement_max != 0:
+        print(f"最大误差性能提升: {improvement_max:.1f}%")

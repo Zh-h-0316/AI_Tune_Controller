@@ -13,6 +13,9 @@ class State:
     psi: float = 0.0
     v: float = 2.0
     delta_actual: float = 0.0
+    roll: float = 0.0
+    pitch: float = 0.0
+    omega: float = 0.0
 
 @dataclass
 class Control:

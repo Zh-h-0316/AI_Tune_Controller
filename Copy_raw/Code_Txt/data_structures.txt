@@ -1,0 +1,89 @@
+"""
+数据结构和基础函数定义
+"""
+import numpy as np
+from dataclasses import dataclass
+from typing import List, Tuple, Optional, Dict
+
+@dataclass
+class State:
+    """车辆状态"""
+    x: float = 0.0      # 位置x
+    y: float = 0.0      # 位置y
+    psi: float = 0.0    # 航向角
+    v: float = 2.0      # 速度
+    delta_actual: float = 0.0  # 实际前轮转角
+
+@dataclass
+class Control:
+    """控制输入"""
+    delta_target: float = 0.0  # 目标前轮转角
+    delta_actual: float = 0.0  # 实际前轮转角（经过惯性环节）
+
+@dataclass
+class ReferencePoint:
+    """参考路径点"""
+    x: float = 0.0
+    y: float = 0.0
+    psi: float = 0.0
+    v: float = 2.0
+    curvature: float = 0.0  # 曲率
+
+@dataclass
+class ErrorState:
+    """误差状态"""
+    e_y: float = 0.0      # 横向偏差
+    e_psi: float = 0.0    # 航向偏差
+    e_y_rate: float = 0.0  # 横向偏差变化率
+    e_psi_rate: float = 0.0  # 航向偏差变化率
+
+@dataclass
+class HistoryState:
+    """历史状态容器"""
+    e_y_history: List[float]  # 横向偏差历史
+    e_psi_history: List[float]  # 航向偏差历史
+    e_y_rate_filtered: float  # 滤波后的横向偏差变化率
+    e_psi_rate_filtered: float  # 滤波后的航向偏差变化率
+    v: float  # 当前速度
+    L: float  # 轴距
+
+def normalize_angle(angle: float) -> float:
+    """将角度归一化到[-π, π]范围"""
+    while angle > np.pi:
+        angle -= 2.0 * np.pi
+    while angle < -np.pi:
+        angle += 2.0 * np.pi
+    return float(angle)  # 确保返回float类型
+
+def rotation_matrix(theta: float) -> np.ndarray:
+    """旋转矩阵"""
+    return np.array([
+        [np.cos(theta), -np.sin(theta)],
+        [np.sin(theta), np.cos(theta)]
+    ])
+
+def moving_average_filter(data: List[float], window_size: int) -> float:
+    """移动平均滤波器"""
+    if len(data) < window_size:
+        return float(np.mean(data)) if data else 0.0
+    return float(np.mean(data[-window_size:]))
+
+def calculate_rate_filtered(data_history: List[float], window_size: int, dt: float) -> float:
+    """计算滤波后的变化率"""
+    if len(data_history) < 2:
+        return 0.0
+    
+    # 使用线性回归计算变化率
+    if len(data_history) >= window_size:
+        recent_data = data_history[-window_size:]
+    else:
+        recent_data = data_history
+    
+    # 创建时间索引
+    t = np.arange(len(recent_data)) * dt
+    
+    # 线性回归
+    A = np.vstack([t, np.ones(len(t))]).T
+    slope, _ = np.linalg.lstsq(A, recent_data, rcond=None)[0]
+    
+    return float(slope)  # 确保返回float类型

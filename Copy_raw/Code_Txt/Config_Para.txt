@@ -1,0 +1,101 @@
+"""
+配置文件 - 集中管理所有重要参数
+"""
+
+# ==================== 车辆参数 ====================
+VEHICLE_L = 2.36  # 轴距 (m) - 固定值
+VEHICLE_WHEELBASE = VEHICLE_L  # 前后轮轴距
+
+# 速度参数
+VEHICLE_V_MIN = 0.1  # 最小速度 (m/s)
+VEHICLE_V_MAX = 8.0  # 最大速度 (m/s)
+VEHICLE_V_STEP = 0.1  # 速度步长 (m/s)
+
+VEHICLE_DT = 0.1  # 时间步长 (s)
+
+# ==================== 惯性环节参数 ====================
+STEERING_TAU = 0.2  # 一阶惯性时间常数 (s)
+STEERING_DELAY_STEPS = 1  # 转向延迟步数
+
+# ==================== MPC参数 ====================
+MPC_DEFAULT_N = 10  # 默认预测步长
+MPC_DEFAULT_Q_EY = 10.0  # 默认横向偏差权重
+MPC_DEFAULT_Q_EPSI = 5.0  # 默认航向偏差权重
+MPC_DEFAULT_R_DELTA = 3.0  # 默认控制权重
+
+MPC_DELTA_MIN = -0.5236  # -30度 (rad)
+MPC_DELTA_MAX = 0.5236   # +30度 (rad)
+
+# MPC参数范围
+MPC_N_MIN = 3
+MPC_N_MAX = 15
+MPC_Q_MIN = 0.1
+MPC_Q_MAX = 20.0
+MPC_R_MIN = 0.1
+MPC_R_MAX = 10.0
+
+# ==================== MPC参数调整模式 ====================
+# 可选: 'both' - 同时调节横向和航向权重
+#       'lateral_only' - 仅调节横向权重
+#       'heading_only' - 仅调节航向权重
+#       'none' - 固定参数，不调节
+MPC_ADJUST_MODE = 'both'  # 默认同时调节横向和航向权重
+
+# ==================== PPO参数 ====================
+PPO_HIDDEN_DIM = 128  # 网络隐藏层维度
+PPO_LEARNING_RATE = 3e-4
+PPO_GAMMA = 0.99  # 折扣因子
+PPO_GAE_LAMBDA = 0.95  # GAE参数
+PPO_CLIP_EPSILON = 0.2  # PPO裁剪参数
+PPO_ENTROPY_COEF = 0.01  # 熵系数
+PPO_VALUE_COEF = 0.5  # 价值系数
+PPO_MAX_GRAD_NORM = 0.5  # 梯度裁剪阈值
+
+# 历史状态参数
+HISTORY_LENGTH = 20  # 历史状态序列长度
+FILTER_WINDOW = 10  # 滤波窗口长度
+
+# PPO动作空间范围 (对应参数的对数)
+PPO_ACTION_MIN = -2.0  # 对应exp(-2)=0.135
+PPO_ACTION_MAX = 2.0   # 对应exp(2)=7.389
+
+# ==================== LSTM参数 ====================
+LSTM_HIDDEN_SIZE = 64  # LSTM隐藏层大小
+LSTM_NUM_LAYERS = 2  # LSTM层数
+
+# ==================== 训练参数 ====================
+TRAIN_MAX_EPISODES = 500
+TRAIN_MAX_STEPS = 200  # 每个episode最大步数
+TRAIN_BATCH_SIZE = 50  # 改为200的因数 (200/50=4)
+TRAIN_UPDATE_EPOCHS = 10
+
+# ==================== 路径参数 ====================
+PATH_STRAIGHT_LENGTH = 50.0
+PATH_SINE_AMPLITUDE = 8.0
+PATH_SINE_FREQUENCY = 0.05
+PATH_CIRCLE_RADIUS = 10.0
+PATH_LANE_CHANGE_WIDTH = 3.5
+PATH_NUM_POINTS = 500
+
+# ==================== 奖励函数参数 ====================
+REWARD_ERROR_WEIGHT = 10.0  # 横向误差权重
+REWARD_HEADING_WEIGHT = 5.0  # 航向误差权重
+REWARD_CONTROL_SMOOTH_WEIGHT = 0.1  # 控制平滑权重
+REWARD_SURVIVAL_BONUS = 1.0  # 存活奖励
+REWARD_BOUNDARY_PENALTY = -50.0  # 边界惩罚
+
+# 终止条件
+MAX_LATERAL_ERROR = 5.0  # 最大允许横向误差 (m)
+MAX_STEPS_PER_EPISODE = 500  # 每轮最大步数
+
+# ==================== 随机噪声参数 ====================
+NOISE_CONTROL_STD = 0.0175  # 控制噪声标准差 (1°)
+NOISE_POSITION_STD = 0.005  # 位置噪声标准差 (5mm)
+NOISE_HEADING_STD = 0.0087  # 航向噪声标准差 (0.5°)
+NOISE_VELOCITY_STD = 0.167  # 速度噪声标准差 (0.167 m/s)
+
+# ==================== 可视化参数 ====================
+VIS_LINE_WIDTH = 1.5
+VIS_ALPHA = 0.7
+VIS_COLORS = ['r', 'g', 'b', 'm', 'c', 'orange']
+VIS_FIG_SIZE = (12, 10)

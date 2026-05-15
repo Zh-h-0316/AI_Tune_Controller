@@ -1,0 +1,188 @@
+"""
+PPO智能体 - 使用Stable-Baselines3库实现PPO算法
+支持LSTM网络结构
+"""
+import torch
+import torch.nn as nn
+import numpy as np
+from stable_baselines3 import PPO
+from stable_baselines3.common.policies import ActorCriticPolicy
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+import Config_Para as cfg
+
+class LSTMFeatureExtractor(BaseFeaturesExtractor):
+    """LSTM特征提取器 - 用于Stable-Baselines3"""
+    
+    def __init__(self, observation_space, features_dim=cfg.PPO_HIDDEN_DIM,
+                 lstm_hidden_size=cfg.LSTM_HIDDEN_SIZE,
+                 lstm_num_layers=cfg.LSTM_NUM_LAYERS):
+        # 计算总输入维度：历史序列展平 + 额外特征
+        history_dim = cfg.HISTORY_LENGTH * 2  # 每个时间步2个特征[e_y, e_psi]
+        extra_dim = 4  # 修正：[e_y_rate, e_psi_rate, v, L]
+        total_input_dim = history_dim + extra_dim
+        
+        super().__init__(observation_space, features_dim)
+        
+        self.history_length = cfg.HISTORY_LENGTH
+        self.lstm = nn.LSTM(
+            input_size=2,  # 每个时间步[e_y, e_psi]
+            hidden_size=lstm_hidden_size,
+            num_layers=lstm_num_layers,
+            batch_first=True,
+            bidirectional=False
+        )
+        
+        # 特征融合层
+        lstm_output_size = lstm_hidden_size
+        self.feature_fusion = nn.Sequential(
+            nn.Linear(lstm_output_size + extra_dim, features_dim),
+            nn.LayerNorm(features_dim),
+            nn.Tanh(),
+            nn.Linear(features_dim, features_dim),
+            nn.LayerNorm(features_dim),
+            nn.Tanh(),
+        )
+    
+    def forward(self, observations):
+        """
+        前向传播
+        
+        Args:
+            observations: [batch_size, total_dim] 总观测维度
+        """
+        batch_size = observations.shape[0]
+        
+        # 分离历史序列和额外特征
+        history_dim = self.history_length * 2
+        history_flat = observations[:, :history_dim]  # [batch_size, history_length*2]
+        extra_features = observations[:, history_dim:]  # [batch_size, 4]
+        
+        # 重塑历史序列为[batch_size, seq_len, 2]
+        history_seq = history_flat.view(batch_size, self.history_length, 2)
+        
+        # LSTM处理
+        lstm_out, (h_n, c_n) = self.lstm(history_seq)
+        
+        # 取最后一个时间步的输出
+        lstm_features = lstm_out[:, -1, :]  # [batch_size, lstm_hidden_size]
+        
+        # 特征融合
+        combined = torch.cat([lstm_features, extra_features], dim=-1)
+        features = self.feature_fusion(combined)
+        
+        return features
+
+class LSTM_ActorCriticPolicy(ActorCriticPolicy):
+    """LSTM Actor-Critic策略 - 自定义网络结构"""
+    
+    def __init__(self, observation_space, action_space, lr_schedule, 
+                 net_arch=None, activation_fn=nn.Tanh, **kwargs):
+        
+        if net_arch is None:
+            # 自定义网络架构 - 修正为字典格式
+            net_arch = {
+                "pi": [cfg.PPO_HIDDEN_DIM//2, cfg.PPO_HIDDEN_DIM//4],   # 策略网络
+                "vf": [cfg.PPO_HIDDEN_DIM//2, cfg.PPO_HIDDEN_DIM//4]    # 价值网络
+            }
+        
+        # 使用LSTM特征提取器
+        features_extractor_class = LSTMFeatureExtractor
+        features_extractor_kwargs = dict(features_dim=cfg.PPO_HIDDEN_DIM)
+        
+        super().__init__(
+            observation_space,
+            action_space,
+            lr_schedule,
+            net_arch=net_arch,
+            activation_fn=activation_fn,
+            features_extractor_class=features_extractor_class,
+            features_extractor_kwargs=features_extractor_kwargs,
+            **kwargs
+        )
+
+class SB3_PPOAgent:
+    """基于Stable-Baselines3的PPO智能体"""
+    
+    def __init__(self, env, device='cpu', policy_kwargs=None, **ppo_kwargs):
+        """
+        初始化SB3 PPO智能体
+        
+        Args:
+            env: 训练环境
+            device: 计算设备
+            policy_kwargs: 策略网络参数
+            ppo_kwargs: PPO算法参数
+        """
+        self.device = device
+        self.env = env
+        
+        # 默认PPO参数
+        default_ppo_kwargs = {
+            'learning_rate': cfg.PPO_LEARNING_RATE,
+            'n_steps': cfg.TRAIN_MAX_STEPS,  # 每轮最大步数
+            'batch_size': cfg.TRAIN_BATCH_SIZE,
+            'n_epochs': cfg.TRAIN_UPDATE_EPOCHS,
+            'gamma': cfg.PPO_GAMMA,
+            'gae_lambda': cfg.PPO_GAE_LAMBDA,
+            'clip_range': cfg.PPO_CLIP_EPSILON,
+            'ent_coef': cfg.PPO_ENTROPY_COEF,
+            'vf_coef': cfg.PPO_VALUE_COEF,
+            'max_grad_norm': cfg.PPO_MAX_GRAD_NORM,
+            'verbose': 1,
+            'tensorboard_log': './ppo_tensorboard/'
+        }
+        
+        # 合并参数
+        default_ppo_kwargs.update(ppo_kwargs)
+        
+        # 确保device参数被传递
+        default_ppo_kwargs['device'] = device
+        
+        # 策略网络参数 - 修正为字典格式
+        if policy_kwargs is None:
+            policy_kwargs = dict(
+                net_arch={
+                    "pi": [cfg.PPO_HIDDEN_DIM//2, cfg.PPO_HIDDEN_DIM//4],
+                    "vf": [cfg.PPO_HIDDEN_DIM//2, cfg.PPO_HIDDEN_DIM//4]
+                },
+                activation_fn=nn.Tanh
+            )
+        
+        # 创建PPO模型
+        self.model = PPO(
+            policy=LSTM_ActorCriticPolicy,
+            env=env,
+            policy_kwargs=policy_kwargs,
+            **default_ppo_kwargs
+        )
+        
+        # 保存训练历史
+        self.training_history = []
+    
+    def train(self, total_timesteps, callback=None, **kwargs):
+        """训练模型"""
+        self.model.learn(
+            total_timesteps=total_timesteps,
+            callback=callback,
+            **kwargs
+        )
+    
+    def predict(self, observation, deterministic=False):
+        """预测动作"""
+        action, _ = self.model.predict(observation, deterministic=deterministic)
+        return action
+    
+    def save(self, path):
+        """保存模型"""
+        self.model.save(path)
+    
+    def load(self, path):
+        """加载模型"""
+        self.model = PPO.load(path, device=self.device)
+    
+    def get_policy_net(self):
+        """获取策略网络"""
+        return self.model.policy
+
+# 为了保持接口一致性，定义PPOAgent为SB3_PPOAgent的别名
+PPOAgent = SB3_PPOAgent

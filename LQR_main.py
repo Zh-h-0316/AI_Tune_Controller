@@ -64,7 +64,12 @@ def run_lqr_simulation(path_type=PATH_TYPE, v_ref=V_REF, plot=True):
     lqr = LQR_car(max_num_iteration=700, tolerance=1e-6, dt=dt)
     lqr.update_car_state(init_state.x, init_state.y, init_state.psi, init_state.v)
     lqr.Update_A_B_matrix(L)
-    lqr.Update_Q_R_matrix(q11=100.0, q22=100.0, r00=10.0, r11=0.01, heading=1)
+    lqr.Update_Q_R_matrix(
+        q11=cfg.ANDROID_LQR_Q1,
+        q22=cfg.ANDROID_LQR_Q2,
+        r00=cfg.ANDROID_LQR_R,
+        r11=cfg.ANDROID_LQR_R11,
+    )
 
     # 数据记录
     time, states, errors, heading_errors, controls, actual_controls, ref_points = [], [], [], [], [], [], []
@@ -79,7 +84,12 @@ def run_lqr_simulation(path_type=PATH_TYPE, v_ref=V_REF, plot=True):
 
         lqr.update_car_state(vehicle.state.x, vehicle.state.y, vehicle.state.psi, vehicle.state.v)
         lqr.Update_A_B_matrix(L)
-        lqr.Update_Q_R_matrix(q11=100.0, q22=100.0, r00=80.0, r11=0.01, heading=1)
+        lqr.Update_Q_R_matrix(
+            q11=cfg.ANDROID_LQR_Q1,
+            q22=cfg.ANDROID_LQR_Q2,
+            r00=cfg.ANDROID_LQR_R,
+            r11=cfg.ANDROID_LQR_R11,
+        )
         delta_target = lqr.CALC(np.array([[e_psi], [e_y]]))
 
         control = Control(delta_target=delta_target)

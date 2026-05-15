@@ -1,0 +1,416 @@
+"""
+三种权重调节模式的对比实验
+"""
+import numpy as np
+import matplotlib.pyplot as plt
+import pickle
+import os
+from datetime import datetime
+import Config_Para as cfg
+from trainer import train_ppo_mpc_sb3, test_ppo_mpc_sb3
+
+def run_adjust_mode_experiment(path_type='sine', total_timesteps=50000, 
+                              num_tests=5, selected_mode=None):
+    """
+    运行完整的MPC参数调整模式对比实验
+    """
+    
+    # 如果指定了特定模式，则只测试该模式
+    if selected_mode is not None:
+        modes = [selected_mode]
+        print(f"运行特定调整模式: {selected_mode}")
+    else:
+        # 否则测试所有模式
+        modes = ['both', 'lateral_only', 'heading_only', 'none']
+        print("运行所有调整模式对比实验")
+    
+    experiment_results = {}
+    
+    print(f"开始MPC参数调整模式对比实验")
+    print(f"路径类型: {path_type}")
+    print(f"总训练步数: {total_timesteps}")
+    print(f"测试次数: {num_tests}")
+    print("="*70)
+    
+    original_mode = cfg.MPC_ADJUST_MODE
+    
+    for mode in modes:
+        print(f"\n训练模式: {mode}")
+        
+        try:
+            # 保存原始调整模式
+            original_mode = cfg.MPC_ADJUST_MODE
+            
+            # 设置当前调整模式
+            cfg.MPC_ADJUST_MODE = mode
+            
+            # 训练模型
+            agent, rewards, errors, params, velocities, best_state = train_ppo_mpc_sb3(
+                path_type=path_type,
+                total_timesteps=total_timesteps,
+                num_envs=1
+            )
+            
+            # 测试模型
+            test_results = test_ppo_mpc_sb3(
+                agent, 
+                path_type=path_type, 
+                num_test=num_tests
+            )
+            
+            # 保存实验结果
+            experiment_results[mode] = {
+                'training_rewards': rewards,
+                'training_errors': errors,
+                'training_params': params,
+                'test_results': test_results,
+                'best_state': best_state,
+                'adjust_mode': mode
+            }
+            
+            print(f"  训练完成，平均奖励: {np.mean(rewards):.2f}")
+            
+        except Exception as e:
+            print(f"  训练失败: {e}")
+            experiment_results[mode] = {'error': str(e)}
+        finally:
+            # 恢复原始模式
+            cfg.MPC_ADJUST_MODE = original_mode
+    
+    # 保存实验结果
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"experiment_adjust_modes_{path_type}_{timestamp}.pkl"
+    
+    with open(filename, 'wb') as f:
+        pickle.dump(experiment_results, f)
+    
+    print(f"\n实验完成，结果已保存为: {filename}")
+    
+    # 分析实验结果
+    analyze_experiment_results(experiment_results)
+    
+    return experiment_results
+
+def analyze_experiment_results(experiment_results):
+    """分析实验结果"""
+    print("\n实验分析结果:")
+    print("="*70)
+    
+    # 提取有效的结果
+    valid_modes = []
+    training_rewards = []
+    test_errors = []
+    test_params = {'N': [], 'Q_ey': [], 'Q_epsi': [], 'R_delta': []}
+    
+    for mode, result in experiment_results.items():
+        if 'training_rewards' in result and 'test_results' in result:
+            valid_modes.append(mode)
+            
+            # 训练奖励
+            if result['training_rewards']:
+                avg_training_reward = np.mean(result['training_rewards'][-10:])  # 最后10轮
+                training_rewards.append(avg_training_reward)
+            else:
+                training_rewards.append(0.0)
+            
+            # 测试误差
+            if result['test_results']:
+                test_errors_list = [r['mean_error'] for r in result['test_results']]
+                avg_test_error = np.mean(test_errors_list)
+                test_errors.append(avg_test_error)
+                
+                # 收集参数信息
+                for test_result in result['test_results']:
+                    if 'avg_params' in test_result:
+                        params = test_result['avg_params']
+                        test_params['N'].append(params.get('N', cfg.MPC_DEFAULT_N))
+                        test_params['Q_ey'].append(params.get('Q_ey', cfg.MPC_DEFAULT_Q_EY))
+                        test_params['Q_epsi'].append(params.get('Q_epsi', cfg.MPC_DEFAULT_Q_EPSI))
+                        test_params['R_delta'].append(params.get('R_delta', cfg.MPC_DEFAULT_R_DELTA))
+            else:
+                test_errors.append(0.0)
+    
+    if not valid_modes:
+        print("没有有效的实验结果")
+        return
+    
+    # 绘制综合对比图
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    
+    # 1. 训练奖励对比
+    ax = axes[0, 0]
+    colors = ['blue', 'green', 'red', 'gray']
+    mode_labels = {
+        'both': '两者都\n动态',
+        'lateral_only': '横向权重\n动态',
+        'heading_only': '航向权重\n动态',
+        'none': '固定参数'
+    }
+    
+    bar_colors = []
+    bar_labels = []
+    for i, mode in enumerate(valid_modes):
+        if mode in mode_labels:
+            bar_labels.append(mode_labels[mode])
+            bar_colors.append(colors[i % len(colors)])
+    
+    bars1 = ax.bar(range(len(valid_modes)), training_rewards, alpha=0.7, 
+                   color=bar_colors)
+    ax.set_xlabel('调整模式')
+    ax.set_ylabel('平均训练奖励 (最后10轮)')
+    ax.set_title('训练奖励对比')
+    ax.set_xticks(range(len(valid_modes)))
+    ax.set_xticklabels(bar_labels, rotation=0, fontsize=10)
+    
+    # 添加数值标签
+    for i, bar in enumerate(bars1):
+        height = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width()/2., height,
+                f'{height:.2f}', ha='center', va='bottom', fontsize=9)
+    
+    # 2. 测试误差对比
+    ax = axes[0, 1]
+    bars2 = ax.bar(range(len(valid_modes)), test_errors, alpha=0.7, 
+                   color=bar_colors)
+    ax.set_xlabel('调整模式')
+    ax.set_ylabel('平均测试误差 (m)')
+    ax.set_title('测试误差对比')
+    ax.set_xticks(range(len(valid_modes)))
+    ax.set_xticklabels(bar_labels, rotation=0, fontsize=10)
+    
+    # 添加数值标签
+    for i, bar in enumerate(bars2):
+        height = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width()/2., height,
+                f'{height:.4f}', ha='center', va='bottom', fontsize=9)
+    
+    # 3. 参数变化对比（箱线图）
+    ax = axes[0, 2]
+    param_data = [test_params['Q_ey'], test_params['Q_epsi'], 
+                  test_params['R_delta'], test_params['N']]
+    param_labels = ['Q_ey', 'Q_epsi', 'R_delta', 'N']
+    box = ax.boxplot(param_data, labels=param_labels, patch_artist=True)
+    
+    # 设置颜色
+    colors = ['lightblue', 'lightgreen', 'lightcoral', 'lightgray']
+    for patch, color in zip(box['boxes'], colors):
+        patch.set_facecolor(color)
+    
+    ax.set_xlabel('参数类型')
+    ax.set_ylabel('参数值')
+    ax.set_title('参数分布对比')
+    ax.grid(True, alpha=0.3, axis='y')
+    
+    # 4. 横向权重Q_ey变化
+    ax = axes[1, 0]
+    for i, mode in enumerate(valid_modes):
+        if mode in experiment_results and 'training_params' in experiment_results[mode]:
+            params_history = experiment_results[mode]['training_params']
+            if params_history:
+                Q_ey_values = [p.get('Q_ey', cfg.MPC_DEFAULT_Q_EY) for p in params_history]
+                episodes = range(len(Q_ey_values))
+                ax.plot(episodes, Q_ey_values, label=mode, linewidth=2, alpha=0.7)
+    
+    ax.axhline(y=cfg.MPC_DEFAULT_Q_EY, color='k', linestyle='--', alpha=0.5, label='默认值')
+    ax.set_xlabel('训练轮次')
+    ax.set_ylabel('横向权重 Q_ey')
+    ax.set_title('横向权重演化对比')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    # 5. 航向权重Q_epsi变化
+    ax = axes[1, 1]
+    for i, mode in enumerate(valid_modes):
+        if mode in experiment_results and 'training_params' in experiment_results[mode]:
+            params_history = experiment_results[mode]['training_params']
+            if params_history:
+                Q_epsi_values = [p.get('Q_epsi', cfg.MPC_DEFAULT_Q_EPSI) for p in params_history]
+                episodes = range(len(Q_epsi_values))
+                ax.plot(episodes, Q_epsi_values, label=mode, linewidth=2, alpha=0.7)
+    
+    ax.axhline(y=cfg.MPC_DEFAULT_Q_EPSI, color='k', linestyle='--', alpha=0.5, label='默认值')
+    ax.set_xlabel('训练轮次')
+    ax.set_ylabel('航向权重 Q_epsi')
+    ax.set_title('航向权重演化对比')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    # 6. 控制权重R_delta变化
+    ax = axes[1, 2]
+    for i, mode in enumerate(valid_modes):
+        if mode in experiment_results and 'training_params' in experiment_results[mode]:
+            params_history = experiment_results[mode]['training_params']
+            if params_history:
+                R_values = [p.get('R_delta', cfg.MPC_DEFAULT_R_DELTA) for p in params_history]
+                episodes = range(len(R_values))
+                ax.plot(episodes, R_values, label=mode, linewidth=2, alpha=0.7)
+    
+    ax.axhline(y=cfg.MPC_DEFAULT_R_DELTA, color='k', linestyle='--', alpha=0.5, label='默认值')
+    ax.set_xlabel('训练轮次')
+    ax.set_ylabel('控制权重 R_delta')
+    ax.set_title('控制权重演化对比')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # 打印最佳模式
+    if test_errors:
+        best_error_idx = np.argmin(test_errors)
+        best_reward_idx = np.argmax(training_rewards)
+        
+        print(f"\n性能总结:")
+        print(f"最低测试误差模式: {valid_modes[best_error_idx]}, 误差: {test_errors[best_error_idx]:.4f}m")
+        print(f"最高训练奖励模式: {valid_modes[best_reward_idx]}, 奖励: {training_rewards[best_reward_idx]:.2f}")
+        
+        # 计算性能提升
+        if len(test_errors) > 1 and 'none' in valid_modes:
+            baseline_idx = valid_modes.index('none')
+            baseline_error = test_errors[baseline_idx]
+            for i, mode in enumerate(valid_modes):
+                if mode != 'none':  # 跳过固定参数模式
+                    improvement = (baseline_error - test_errors[i]) / baseline_error * 100
+                    print(f"  模式 {mode} 相对于固定参数的误差降低: {improvement:.1f}%")
+
+def plot_parameter_adaptation_comparison(experiment_results):
+    """绘制参数适应对比图"""
+    fig, axes = plt.subplots(3, 2, figsize=(15, 12))
+    
+    modes = ['both', 'lateral_only', 'heading_only']
+    mode_labels = {
+        'both': '两者都动态', 
+        'lateral_only': '横向权重动态', 
+        'heading_only': '航向权重动态'
+    }
+    
+    for idx, mode in enumerate(modes):
+        if mode not in experiment_results:
+            continue
+            
+        result = experiment_results[mode]
+        if 'test_results' not in result or not result['test_results']:
+            continue
+        
+        test_result = result['test_results'][0]
+        if 'params_history' not in test_result:
+            continue
+        
+        params_history = test_result['params_history']
+        steps = range(len(params_history))
+        
+        # 横向权重变化
+        ax = axes[idx, 0]
+        if mode == 'lateral_only' or mode == 'both':
+            Q_ey_values = [p.get('Q_ey', cfg.MPC_DEFAULT_Q_EY) for p in params_history]
+            ax.plot(steps, Q_ey_values, 'b-', linewidth=2, label='Q_ey (横向)')
+        
+        if mode == 'heading_only' or mode == 'both':
+            Q_epsi_values = [p.get('Q_epsi', cfg.MPC_DEFAULT_Q_EPSI) for p in params_history]
+            ax.plot(steps, Q_epsi_values, 'g-', linewidth=2, label='Q_epsi (航向)')
+        
+        ax.axhline(y=cfg.MPC_DEFAULT_Q_EY, color='b', linestyle='--', alpha=0.5, label='Q_ey默认值')
+        ax.axhline(y=cfg.MPC_DEFAULT_Q_EPSI, color='g', linestyle='--', alpha=0.5, label='Q_epsi默认值')
+        
+        ax.set_xlabel('时间步')
+        ax.set_ylabel('权重值')
+        ax.set_title(f'{mode_labels[mode]} - 权重参数适应')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        # 控制权重变化
+        ax = axes[idx, 1]
+        R_values = [p.get('R_delta', cfg.MPC_DEFAULT_R_DELTA) for p in params_history]
+        N_values = [p.get('N', cfg.MPC_DEFAULT_N) for p in params_history]
+        
+        ax.plot(steps, R_values, 'r-', linewidth=2, label='R_delta (控制)')
+        ax.plot(steps, N_values, 'm-', linewidth=2, label='N (预测步长)')
+        
+        ax.axhline(y=cfg.MPC_DEFAULT_R_DELTA, color='r', linestyle='--', alpha=0.5, label='R默认值')
+        ax.axhline(y=cfg.MPC_DEFAULT_N, color='m', linestyle='--', alpha=0.5, label='N默认值')
+        
+        ax.set_xlabel('时间步')
+        ax.set_ylabel('参数值')
+        ax.set_title(f'{mode_labels[mode]} - 其他参数适应')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
+
+def compare_three_adjustment_modes():
+    """主函数：比较三种调整模式"""
+    print("="*70)
+    print("PPO-MPC权重调节模式对比实验")
+    print("="*70)
+    
+    # 选择实验类型
+    print("\n选择实验类型:")
+    print("1. 比较所有调整模式")
+    print("2. 测试特定调整模式")
+    print("3. 仅运行最佳调整模式对比")
+    experiment_choice = input("请选择 (1-3): ").strip()
+    
+    # 路径选择
+    print("\n选择路径类型:")
+    print("1. 直线路径")
+    print("2. 正弦路径")
+    print("3. 圆形路径")
+    print("4. 换道路径")
+    path_choice = input("请选择 (1-4): ").strip()
+    
+    path_types = ['straight', 'sine', 'circle', 'lane_change']
+    path_type = path_types[int(path_choice) - 1] if path_choice in ['1', '2', '3', '4'] else 'sine'
+    
+    # 调整模式选择（如果需要）
+    selected_mode = None
+    if experiment_choice == '2':
+        print("\n选择调整模式:")
+        print("1. 同时调节横向和航向权重 (both)")
+        print("2. 仅调节横向权重 (lateral_only)")
+        print("3. 仅调节航向权重 (heading_only)")
+        print("4. 固定参数，不调节 (none)")
+        mode_choice = input("请选择 (1-4): ").strip()
+        
+        adjust_modes = ['both', 'lateral_only', 'heading_only', 'none']
+        selected_mode = adjust_modes[int(mode_choice) - 1] if mode_choice in ['1', '2', '3', '4'] else 'both'
+        print(f"选择模式: {selected_mode}")
+    
+    # 训练参数
+    try:
+        total_timesteps = int(input("请输入总训练步数（推荐: 50000）: ").strip() or "50000")
+    except ValueError:
+        total_timesteps = 50000
+    
+    try:
+        num_tests = int(input("请输入测试次数（推荐: 5）: ").strip() or "5")
+    except ValueError:
+        num_tests = 5
+    
+    print(f"\n实验设置:")
+    print(f"实验类型: {experiment_choice}")
+    print(f"路径类型: {path_type}")
+    if selected_mode:
+        print(f"调整模式: {selected_mode}")
+    else:
+        print(f"调整模式: 所有模式对比")
+    print(f"总训练步数: {total_timesteps}")
+    print(f"测试次数: {num_tests}")
+    print("="*70)
+    
+    # 运行实验
+    experiment_results = run_adjust_mode_experiment(
+        path_type=path_type,
+        total_timesteps=total_timesteps,
+        num_tests=num_tests,
+        selected_mode=selected_mode
+    )
+    
+    # 如果不是单一模式实验，绘制参数适应对比图
+    if selected_mode is None or selected_mode in ['both', 'lateral_only', 'heading_only']:
+        plot_parameter_adaptation_comparison(experiment_results)
+    
+    return experiment_results
+
+if __name__ == "__main__":
+    compare_three_adjustment_modes()

@@ -1,0 +1,370 @@
+"""
+强化学习环境 - 使用LSTM处理历史状态，包含惯性环节
+"""
+import gymnasium as gym
+from gymnasium import spaces
+import numpy as np
+from data_structures import State, Control, ErrorState, HistoryState
+from vehicle_model import VehicleModel, PathTracker
+from path_generator import PathGenerator
+from adaptive_mpc import AdaptiveMPC
+import Config_Para as cfg
+
+class VehicleMPCEnv(gym.Env):
+    """车辆MPC控制强化学习环境 - 使用LSTM处理历史状态"""
+    
+    def __init__(self, dt=cfg.VEHICLE_DT, L=cfg.VEHICLE_L, 
+                 path_type='sine'):
+        super(VehicleMPCEnv, self).__init__()
+        
+        self.dt = dt
+        self.L = L
+        self.path_type = path_type
+        
+        # 随机选择速度（每次重置时重新选择）
+        self.v_ref = None
+        
+        # 根据调整模式设置动作空间
+        if cfg.MPC_ADJUST_MODE == 'both':
+            # 四个参数：N_norm, Q_ey_norm, Q_epsi_norm, R_delta_norm
+            action_low = np.array([-1.0, -1.0, -1.0, -1.0], dtype=np.float32)
+            action_high = np.array([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
+            self.action_dim = 4
+        elif cfg.MPC_ADJUST_MODE == 'lateral_only':
+            # 三个参数：N_norm, Q_ey_norm, R_delta_norm (航向权重固定)
+            action_low = np.array([-1.0, -1.0, -1.0], dtype=np.float32)
+            action_high = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+            self.action_dim = 3
+        elif cfg.MPC_ADJUST_MODE == 'heading_only':
+            # 三个参数：N_norm, Q_epsi_norm, R_delta_norm (横向权重固定)
+            action_low = np.array([-1.0, -1.0, -1.0], dtype=np.float32)
+            action_high = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+            self.action_dim = 3
+        else:  # 'none'
+            # 不调整参数，但需要占位动作
+            action_low = np.array([0.0], dtype=np.float32)
+            action_high = np.array([0.0], dtype=np.float32)
+            self.action_dim = 1
+        
+        self.action_space = spaces.Box(
+            low=action_low,
+            high=action_high,
+            dtype=np.float32
+        )
+        
+        # 状态空间特征：每个时间步的特征维度为2 [e_y, e_psi]
+        self.state_feature_dim = 2
+        
+        # 观测空间：历史序列 + 额外特征
+        # 历史序列: [history_length, 2] -> 展平为 [history_length * 2]
+        # 额外特征: [4] -> [e_y_rate, e_psi_rate, v, L]
+        obs_low = np.concatenate([
+            np.array([-5.0, -np.pi] * cfg.HISTORY_LENGTH, dtype=np.float32),  # 历史状态
+            np.array([-1.0, -1.0, cfg.VEHICLE_V_MIN, L], dtype=np.float32)    # 额外特征
+        ])
+        
+        obs_high = np.concatenate([
+            np.array([5.0, np.pi] * cfg.HISTORY_LENGTH, dtype=np.float32),    # 历史状态
+            np.array([1.0, 1.0, cfg.VEHICLE_V_MAX, L], dtype=np.float32)      # 额外特征
+        ])
+        
+        self.observation_space = spaces.Box(
+            low=obs_low,
+            high=obs_high,
+            dtype=np.float32
+        )
+        
+        # 初始化车辆和路径
+        self.vehicle = VehicleModel(L=L, dt=dt)  # 先创建默认车辆
+        self.tracker = PathTracker(lookahead_distance=5.0)
+        self.controller = AdaptiveMPC(dt=dt, L=L)
+        
+        # 历史状态缓冲区
+        self.e_y_buffer = []
+        self.e_psi_buffer = []
+        
+        # 生成路径
+        self.generate_path()
+        
+        # 重置环境
+        self.reset()
+    
+    def generate_path(self):
+        """生成参考路径"""
+        if self.path_type == 'straight':
+            path = PathGenerator.generate_straight_path(
+                length=cfg.PATH_STRAIGHT_LENGTH, 
+                num_points=cfg.PATH_NUM_POINTS
+            )
+        elif self.path_type == 'sine':
+            path = PathGenerator.generate_sine_path(
+                amplitude=cfg.PATH_SINE_AMPLITUDE, 
+                frequency=cfg.PATH_SINE_FREQUENCY,
+                num_points=cfg.PATH_NUM_POINTS
+            )
+        elif self.path_type == 'circle':
+            path = PathGenerator.generate_circle_path(
+                radius=cfg.PATH_CIRCLE_RADIUS,
+                num_points=cfg.PATH_NUM_POINTS
+            )
+        elif self.path_type == 'lane_change':
+            path = PathGenerator.generate_lane_change_path(
+                lane_width=cfg.PATH_LANE_CHANGE_WIDTH,
+                num_points=cfg.PATH_NUM_POINTS
+            )
+        else:
+            path = PathGenerator.generate_sine_path()
+        
+        self.tracker.set_path(path)
+        self.path = path
+    
+    def get_obs(self):
+        """获取观测值（历史序列 + 额外特征）"""
+        # 获取当前状态
+        state = self.vehicle.state
+        target_point = self.tracker.find_target_point(state)
+        error = self.vehicle.calc_errors(target_point)
+        
+        # 更新历史缓冲区
+        self.e_y_buffer.append(error.e_y)
+        self.e_psi_buffer.append(error.e_psi)
+        
+        # 限制缓冲区长度
+        if len(self.e_y_buffer) > cfg.HISTORY_LENGTH + cfg.FILTER_WINDOW:
+            self.e_y_buffer.pop(0)
+            self.e_psi_buffer.pop(0)
+        
+        # 构建历史序列
+        e_y_history = self.e_y_buffer[-cfg.HISTORY_LENGTH:] if len(self.e_y_buffer) >= cfg.HISTORY_LENGTH else self.e_y_buffer
+        e_psi_history = self.e_psi_buffer[-cfg.HISTORY_LENGTH:] if len(self.e_psi_buffer) >= cfg.HISTORY_LENGTH else self.e_psi_buffer
+        
+        # 补零以保持固定长度
+        if len(e_y_history) < cfg.HISTORY_LENGTH:
+            e_y_history = [0.0] * (cfg.HISTORY_LENGTH - len(e_y_history)) + e_y_history
+            e_psi_history = [0.0] * (cfg.HISTORY_LENGTH - len(e_psi_history)) + e_psi_history
+        
+        # 计算额外特征
+        from data_structures import calculate_rate_filtered
+        e_y_rate = calculate_rate_filtered(self.e_y_buffer, cfg.FILTER_WINDOW, self.dt)
+        e_psi_rate = calculate_rate_filtered(self.e_psi_buffer, cfg.FILTER_WINDOW, self.dt)
+        
+        # 构建历史序列数组 [seq_len, 2]
+        history_sequence = np.column_stack([e_y_history, e_psi_history])
+        
+        # 额外特征数组 [4]
+        extra_features = np.array([
+            e_y_rate,
+            e_psi_rate,
+            state.v,
+            self.L
+        ], dtype=np.float32)
+        
+        # 展平历史序列用于观测空间
+        obs = np.concatenate([
+            history_sequence.flatten(),
+            extra_features
+        ]).astype(np.float32)
+        
+        return obs, history_sequence, extra_features
+    
+    def reset(self, seed=None, options=None):
+        """重置环境"""
+        if seed is not None:
+            np.random.seed(seed)
+            
+        # 随机选择速度（离散变化，步长0.1）
+        v_options = np.arange(cfg.VEHICLE_V_MIN, cfg.VEHICLE_V_MAX + cfg.VEHICLE_V_STEP, cfg.VEHICLE_V_STEP)
+        self.v_ref = np.random.choice(v_options)
+        
+        # 获取路径对应的初始状态
+        x0, y0, psi0 = PathGenerator.get_initial_state_for_path(self.path_type)
+        
+        # 创建初始状态
+        initial_state = State(x=x0, y=y0, psi=psi0, v=self.v_ref)
+        
+        # 重置车辆模型
+        self.vehicle.reset(state=initial_state, v_ref=self.v_ref)
+        
+        # 重置历史缓冲区
+        self.e_y_buffer = []
+        self.e_psi_buffer = []
+        
+        # 获取初始误差
+        target_point = self.tracker.find_target_point(initial_state)
+        initial_error = self.vehicle.calc_errors(target_point)
+        
+        # 填充初始历史
+        for _ in range(cfg.HISTORY_LENGTH):
+            self.e_y_buffer.append(initial_error.e_y)
+            self.e_psi_buffer.append(initial_error.e_psi)
+        
+        # 重置MPC控制器
+        self.controller.reset()
+        
+        # 重置步数
+        self.step_count = 0
+        self.total_reward = 0.0
+        
+        # 获取观测值
+        obs, history_seq, extra_feat = self.get_obs()
+        
+        info = {
+            'history_sequence': history_seq,
+            'extra_features': extra_feat,
+            'v_ref': self.v_ref
+        }
+        
+        return obs, info
+    
+    def step(self, action):
+        """
+        执行一步动作
+        
+        Args:
+            action: 根据调整模式不同，动作维度不同
+        """
+        self.step_count += 1
+        
+        # 根据调整模式解析动作
+        if cfg.MPC_ADJUST_MODE == 'both':
+            # 动作: [N_norm, Q_ey_norm, Q_epsi_norm, R_delta_norm]
+            N_norm, Q_ey_norm, Q_epsi_norm, R_delta_norm = action
+        elif cfg.MPC_ADJUST_MODE == 'lateral_only':
+            # 动作: [N_norm, Q_ey_norm, R_delta_norm]
+            N_norm, Q_ey_norm, R_delta_norm = action
+            Q_epsi_norm = 0.0  # 航向权重固定，使用默认值对应的归一化值
+        elif cfg.MPC_ADJUST_MODE == 'heading_only':
+            # 动作: [N_norm, Q_epsi_norm, R_delta_norm]
+            N_norm, Q_epsi_norm, R_delta_norm = action
+            Q_ey_norm = 0.0  # 横向权重固定，使用默认值对应的归一化值
+        else:  # 'none'
+            # 不调整参数
+            N_norm, Q_ey_norm, Q_epsi_norm, R_delta_norm = 0.0, 0.0, 0.0, 0.0
+        
+        # 映射预测步长到整数
+        N = int(cfg.MPC_N_MIN + (N_norm + 1) / 2 * (cfg.MPC_N_MAX - cfg.MPC_N_MIN))
+        
+        # 映射权重参数（使用指数函数确保为正）
+        Q_ey = cfg.MPC_Q_MIN * (cfg.MPC_Q_MAX / cfg.MPC_Q_MIN) ** ((Q_ey_norm + 1) / 2)
+        Q_epsi = cfg.MPC_Q_MIN * (cfg.MPC_Q_MAX / cfg.MPC_Q_MIN) ** ((Q_epsi_norm + 1) / 2)
+        R_delta = cfg.MPC_R_MIN * (cfg.MPC_R_MAX / cfg.MPC_R_MIN) ** ((R_delta_norm + 1) / 2)
+        
+        # 更新MPC参数
+        self.controller.update_parameters(N, Q_ey, Q_epsi, R_delta)
+        
+        # 计算MPC控制（目标转角）
+        control = self.controller.solve(self.vehicle, self.tracker)
+        
+        # 更新车辆状态（通过惯性环节得到实际转角）
+        self.vehicle.update(control)
+        
+        # 获取当前状态和误差
+        state = self.vehicle.state
+        target_point = self.tracker.find_target_point(state)
+        error = self.vehicle.calc_errors(target_point)
+        
+        # 计算奖励（改进的奖励函数）
+        reward = self.calculate_reward_improved(error, control)
+        self.total_reward += reward
+        
+        # 检查终止条件
+        terminated = self.check_done(error)
+        
+        # 生成新的观测值
+        obs, history_seq, extra_feat = self.get_obs()
+        
+        # 获取MPC参数
+        mpc_params = self.controller.get_parameters()
+        
+        info = {
+            'lateral_error': abs(error.e_y),
+            'heading_error': abs(error.e_psi),
+            'control_target': control.delta_target,
+            'control_actual': control.delta_actual,
+            'mpc_params': mpc_params,
+            'step': self.step_count,
+            'total_reward': self.total_reward,
+            'v_ref': self.v_ref,
+            'history_sequence': history_seq,
+            'extra_features': extra_feat,
+            'adjust_mode': cfg.MPC_ADJUST_MODE
+        }
+        
+        truncated = False
+        
+        return obs, reward, terminated, truncated, info
+    
+    def calculate_reward_improved(self, error: ErrorState, control: Control) -> float:
+        """改进的奖励函数（考虑惯性环节）"""
+        # 1. 跟踪误差奖励（指数衰减）
+        lateral_error_reward = -cfg.REWARD_ERROR_WEIGHT * (error.e_y ** 2)
+        heading_error_reward = -cfg.REWARD_HEADING_WEIGHT * (error.e_psi ** 2)
+        
+        # 2. 控制平滑奖励（惩罚目标控制变化率）
+        control_smooth_reward = 0.0
+        if hasattr(self, 'last_control_target'):
+            delta_change = control.delta_target - self.last_control_target
+            control_smooth_reward = -cfg.REWARD_CONTROL_SMOOTH_WEIGHT * (delta_change ** 2)
+        
+        # 3. 目标与实际控制偏差惩罚
+        control_tracking_reward = -0.2 * ((control.delta_target - control.delta_actual) ** 2)
+        
+        # 4. 控制量惩罚（防止过大转向）
+        control_magnitude_reward = -0.05 * (control.delta_target ** 2)
+        
+        # 5. 速度适应奖励（高速时要求更精确）
+        speed_factor = self.vehicle.v_ref / cfg.VEHICLE_V_MAX
+        speed_adapt_reward = -speed_factor * (error.e_y ** 2)
+        
+        # 6. 边界惩罚
+        boundary_penalty = 0.0
+        if abs(error.e_y) > 2.0:
+            boundary_penalty = cfg.REWARD_BOUNDARY_PENALTY * (abs(error.e_y) - 2.0)
+        
+        # 7. 存活奖励
+        survival_reward = cfg.REWARD_SURVIVAL_BONUS
+        
+        # 8. 进度奖励（沿着路径前进）
+        progress_reward = 0.1 if abs(error.e_y) < 0.5 else 0.0
+        
+        # 组合奖励
+        total_reward = (
+            lateral_error_reward + 
+            heading_error_reward + 
+            control_smooth_reward + 
+            control_tracking_reward + 
+            control_magnitude_reward + 
+            speed_adapt_reward + 
+            boundary_penalty + 
+            survival_reward + 
+            progress_reward
+        )
+        
+        # 保存当前控制用于下一次计算
+        self.last_control_target = control.delta_target
+        
+        return total_reward
+    
+    def check_done(self, error: ErrorState) -> bool:
+        """检查是否终止"""
+        # 最大步数
+        if self.step_count >= cfg.MAX_STEPS_PER_EPISODE:
+            return True
+        
+        # 误差过大
+        if abs(error.e_y) > cfg.MAX_LATERAL_ERROR:
+            return True
+        
+        # 完成路径跟踪
+        if self.tracker.current_target_idx >= len(self.path) - 10:
+            return True
+        
+        return False
+    
+    def render(self, mode='human'):
+        """渲染环境（可选）"""
+        pass
+    
+    def close(self):
+        """关闭环境"""
+        pass
