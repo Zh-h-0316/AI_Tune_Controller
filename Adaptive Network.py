@@ -57,24 +57,26 @@ TRAIN_CONFIG = {
     'GRAD_CLIP_NORM': 1.0,           # 梯度裁剪阈值
     'HUBER_BETA': 0.03,              # SmoothL1(Huber) beta
     'SMOOTH_LOSS_WEIGHT': 0.2,       # 控制量平滑损失权重（当前未启用）
-    'STEER_LIMIT_LOSS_WEIGHT': 0.02,  # 转角越界惩罚权重（降低，减少输出被过度抑制）
-    'RATE_LOSS_WEIGHT': 0.01,        # 控制变化率惩罚权重（降低，减少补偿幅值被抹平）
-    'COMP_LOSS_WEIGHT': 0.8,         # 残差对齐损失权重：鼓励模型输出足够补偿量
+    'STEER_LIMIT_LOSS_WEIGHT': 0.03,  # 转角越界惩罚权重：抑制过量补偿导致的执行器顶边运行
+    'RATE_LOSS_WEIGHT': 0.03,        # 控制变化率惩罚权重：抑制实车左右摆动
+    'COMP_LOSS_WEIGHT': 0.6,         # 残差对齐损失权重：保留补偿学习，但不过度追求大幅补偿
     'COMP_FOCUS_GAMMA': 1.0,         # 残差越大权重越高，重点学习大补偿样本
-    'UNDER_COMP_LOSS_WEIGHT': 0.2,   # 补偿不足惩罚：抑制模型整体偏保守、输出普遍偏低
+    'UNDER_COMP_LOSS_WEIGHT': 0.08,  # 补偿不足惩罚：保留轻度推动，避免整体偏保守
+    'OVER_COMP_LOSS_WEIGHT': 0.25,   # 补偿过量惩罚：抑制实车中因过补偿导致的左右摆动
     'MODE_A_ALPHA_RANGE': (0.3, 1.8),  # 模式A中alpha输出范围
     'MODE_A_BETA_SCALE': 0.25,       # 模式A中beta输出范围[-scale, scale]
     'MODE_D_DELTA_SCALE': 0.30,      # 模式D补偿量缩放上限（原先0.1偏小）
+    'MODE_D_USE_TANH_BOUND': True,   # 模式D输出使用tanh限幅，确保DELTA_SCALE真正作为补偿上限
     'DATA_AUG_NOISE': 0.01,          # 数据增强噪声标准差（0表示关闭）
     'VAL_SPLIT': 0.2,                 # 验证集比例
     'USE_SPEED_STRATIFIED_SPLIT': True,  # 是否按速度区间分层划分（与Group Split结合）
     'SPEED_BINS_MPS': [1.0 / 3.6, 4.0 / 3.6, 7.0 / 3.6, 10.0 / 3.6, 15.0 / 3.6, 20.0 / 3.6, 30.0 / 3.6],
     # 速度分层边界(m/s)，按真实作业车速划分：
     # [0,1km/h), [1,4km/h), [4,7km/h), [7,10km/h), [10,15km/h), [15,20km/h), [20,30km/h), [30km/h,+inf)
-    'SPEED_BIN_MIN_RATIO_FILTER_ENABLED': True,  # 是否过滤样本占比过低的速度区间
-    'SPEED_BIN_MIN_RATIO': 0.05,     # 速度区间样本占比低于该阈值时，不参与训练与评估
+    'SPEED_BIN_MIN_RATIO_FILTER_ENABLED': False,  # 少样本速度段不再丢弃，仅保留统计输出
+    'SPEED_BIN_MIN_RATIO': 0.0,      # 仅保留兼容字段，不再用于训练与评估过滤
     'LOW_SPEED_THRESHOLD_MPS': 1.0 / 3.6,  # 低速重点区间上界，用于损失加权与结果解读
-    'LOW_SPEED_LOSS_BOOST': 1.8,     # 低速段损失增强，重点提升0~1km/h拟合
+    'LOW_SPEED_LOSS_BOOST': 1.0,     # 取消低速额外权重放大，避免低速样本主导补偿学习
     'SPEED_LOSS_MIN_WEIGHT': 0.9,    # 分速度段损失权重下限，避免牺牲其他速度段
     'SPEED_LOSS_MAX_WEIGHT': 2.4,    # 分速度段损失权重上限，避免低速权重过大挤压其他速度段
     'SPEED_FEATURE_GAIN': 1.8,       # 速度特征增强系数，提升模型对速度变化的敏感性
@@ -300,60 +302,55 @@ def _build_speed_bin_loss_weights(speed_values, config=None, *, device=None):
 
 def _filter_samples_by_speed_bin_ratio(samples, config=None):
     config = TRAIN_CONFIG if config is None else config
-    if not bool(config.get('SPEED_BIN_MIN_RATIO_FILTER_ENABLED', False)):
-        return samples
-
     if not samples:
-        return samples
-
-    min_ratio = float(config.get('SPEED_BIN_MIN_RATIO', 0.0))
-    if min_ratio <= 0.0:
         return samples
 
     speed_bins = _get_speed_bin_edges(config)
     num_bins = len(speed_bins) + 1
     counts = [0] * num_bins
+    for sample in samples:
+        speed_val = float(sample['scalar'][0])
+        counts[_speed_bin_id(speed_val, speed_bins)] += 1
+
+    if not bool(config.get('SPEED_BIN_MIN_RATIO_FILTER_ENABLED', False)):
+        print(
+            "Speed-bin ratio filter disabled; all samples are retained. "
+            f"bin_counts[{_format_speed_bin_count_report(counts, speed_bins)}]"
+        )
+        return samples
+
+    min_ratio = float(config.get('SPEED_BIN_MIN_RATIO', 0.0))
+    if min_ratio <= 0.0:
+        print(
+            "Speed-bin ratio filter threshold <= 0; all samples are retained. "
+            f"bin_counts[{_format_speed_bin_count_report(counts, speed_bins)}]"
+        )
+        return samples
+
     sample_bin_ids = []
     for sample in samples:
         speed_val = float(sample['scalar'][0])
         bin_id = _speed_bin_id(speed_val, speed_bins)
         sample_bin_ids.append(bin_id)
-        counts[bin_id] += 1
-
-    total_count = len(samples)
-    ratios = [count / max(1, total_count) for count in counts]
-    keep_bin_ids = {idx for idx, ratio in enumerate(ratios) if ratio >= min_ratio}
-    removed_bin_ids = [idx for idx in range(num_bins) if idx not in keep_bin_ids]
-
-    if not removed_bin_ids:
-        print(
-            f"Speed-bin ratio filter enabled (threshold={min_ratio:.2%}), no bins removed. "
-            f"ratios[{_format_speed_bin_value_report(ratios, speed_bins)}]"
-        )
-        return samples
-
-    filtered_samples = [sample for sample, bin_id in zip(samples, sample_bin_ids) if bin_id in keep_bin_ids]
-    labels = _get_speed_bin_labels(speed_bins)
-    removed_desc = ', '.join(f"{labels[idx]}:{ratios[idx]:.2%}" for idx in removed_bin_ids)
-    kept_counts = [0] * num_bins
-    for sample in filtered_samples:
-        kept_counts[_speed_bin_id(float(sample['scalar'][0]), speed_bins)] += 1
-
     print(
-        f"Speed-bin ratio filter enabled (threshold={min_ratio:.2%}), removed bins[{removed_desc}]"
+        "Speed-bin ratio filtering has been retired; keeping all samples. "
+        f"requested_threshold={min_ratio:.2%}, bin_ratios[{_format_speed_bin_value_report([count / max(1, len(samples)) for count in counts], speed_bins)}]"
     )
-    print(
-        f"Filtered samples: {len(filtered_samples)}/{len(samples)} kept | "
-        f"kept_bins[{_format_speed_bin_count_report(kept_counts, speed_bins)}]"
-    )
+    return samples
 
-    if len(filtered_samples) == 0:
-        raise RuntimeError(
-            "速度区间占比过滤后无可用样本。"
-            f"请降低 SPEED_BIN_MIN_RATIO 或关闭 SPEED_BIN_MIN_RATIO_FILTER_ENABLED。"
-        )
 
-    return filtered_samples
+def _compute_compensation_balance_losses(model_comp, residual, speed_sample_weight, config=None):
+    config = TRAIN_CONFIG if config is None else config
+    residual_abs = torch.abs(residual).detach()
+    residual_norm = residual_abs.mean().detach() + 1e-6
+    focus_weight = 1.0 + float(config.get('COMP_FOCUS_GAMMA', 1.0)) * (residual_abs / residual_norm)
+    sample_weight = speed_sample_weight * focus_weight
+    abs_model_comp = torch.abs(model_comp)
+    abs_residual = torch.abs(residual)
+    loss_comp = (sample_weight * torch.abs(model_comp - residual)).mean()
+    loss_under_comp = (speed_sample_weight * torch.relu(abs_residual - abs_model_comp)).mean()
+    loss_over_comp = (speed_sample_weight * torch.relu(abs_model_comp - abs_residual)).mean()
+    return loss_comp, loss_under_comp, loss_over_comp
 
 
 def _extract_source_group(source_id, data_root=None):
@@ -1018,7 +1015,7 @@ class AdaptiveNetwork(nn.Module):
                  lstm_layers=2, lstm_dropout=0.3, use_attention=True,
                  mlp_hidden=[128, 64], mlp_dropout=0.2,
                  mode_a_alpha_range=(0.5, 1.5), mode_a_beta_scale=0.1,
-                 mode_d_delta_scale=0.1, speed_feature_gain=1.8):
+                 mode_d_delta_scale=0.1, mode_d_use_tanh_bound=False, speed_feature_gain=1.8):
         super().__init__()
         self.mode = mode
         self.use_attention = use_attention
@@ -1029,6 +1026,7 @@ class AdaptiveNetwork(nn.Module):
             self.mode_a_alpha_min, self.mode_a_alpha_max = 0.5, 1.5
         self.mode_a_beta_scale = float(mode_a_beta_scale)
         self.mode_d_delta_scale = float(mode_d_delta_scale)
+        self.mode_d_use_tanh_bound = bool(mode_d_use_tanh_bound)
         self.speed_feature_gain = float(speed_feature_gain)
 
         # LSTM层
@@ -1133,9 +1131,10 @@ class AdaptiveNetwork(nn.Module):
             return alpha_e, beta_e, alpha_th, beta_th
 
         elif self.mode == ControlMode.D:
-            delta_add = mlp_out[:, 0] * self.mode_d_delta_scale
-            # 也可加tanh限制，例如：
-            # delta_add = torch.tanh(mlp_out[:, 0]) * 0.1
+            if self.mode_d_use_tanh_bound:
+                delta_add = torch.tanh(mlp_out[:, 0]) * self.mode_d_delta_scale
+            else:
+                delta_add = mlp_out[:, 0] * self.mode_d_delta_scale
             return delta_add
 
         else:
@@ -1625,6 +1624,7 @@ def generate_deployment_files(model_path, config_path):
         mode_a_alpha_range=train_config.get('MODE_A_ALPHA_RANGE', (0.5, 1.5)),
         mode_a_beta_scale=train_config.get('MODE_A_BETA_SCALE', 0.1),
         mode_d_delta_scale=train_config.get('MODE_D_DELTA_SCALE', 0.1),
+        mode_d_use_tanh_bound=train_config.get('MODE_D_USE_TANH_BOUND', False),
         speed_feature_gain=train_config.get('SPEED_FEATURE_GAIN', 1.8)
     )
     _load_adaptive_network_state(
@@ -2249,6 +2249,7 @@ def train_network(resume_model_path=None):
         mode_a_alpha_range=TRAIN_CONFIG.get('MODE_A_ALPHA_RANGE', (0.5, 1.5)),
         mode_a_beta_scale=TRAIN_CONFIG.get('MODE_A_BETA_SCALE', 0.1),
         mode_d_delta_scale=TRAIN_CONFIG.get('MODE_D_DELTA_SCALE', 0.1),
+        mode_d_use_tanh_bound=TRAIN_CONFIG.get('MODE_D_USE_TANH_BOUND', False),
         speed_feature_gain=TRAIN_CONFIG.get('SPEED_FEATURE_GAIN', 1.8),
     ).to(device)
 
@@ -2347,12 +2348,12 @@ def train_network(resume_model_path=None):
 
                 # 残差对齐：显式学习“应补偿多少”而不仅是最终角度误差
                 residual = delta_opt - delta_base
-                residual_abs = torch.abs(residual).detach()
-                residual_norm = residual_abs.mean().detach() + 1e-6
-                focus_weight = 1.0 + float(TRAIN_CONFIG.get('COMP_FOCUS_GAMMA', 1.0)) * (residual_abs / residual_norm)
-                sample_weight = speed_sample_weight * focus_weight
-                loss_comp = (sample_weight * torch.abs(model_comp - residual)).mean()
-                loss_under_comp = (speed_sample_weight * torch.relu(torch.abs(residual) - torch.abs(model_comp))).mean()
+                loss_comp, loss_under_comp, loss_over_comp = _compute_compensation_balance_losses(
+                    model_comp,
+                    residual,
+                    speed_sample_weight,
+                    TRAIN_CONFIG,
+                )
 
                 # 越界惩罚：抑制模型输出超出执行器物理边界
                 overflow_upper = torch.relu(delta_pred - steer_max)
@@ -2372,6 +2373,7 @@ def train_network(resume_model_path=None):
                     + TRAIN_CONFIG['RATE_LOSS_WEIGHT'] * loss_rate
                     + TRAIN_CONFIG.get('COMP_LOSS_WEIGHT', 0.0) * loss_comp
                     + TRAIN_CONFIG.get('UNDER_COMP_LOSS_WEIGHT', 0.0) * loss_under_comp
+                    + TRAIN_CONFIG.get('OVER_COMP_LOSS_WEIGHT', 0.0) * loss_over_comp
                 )
 
             optimizer.zero_grad()
@@ -2447,12 +2449,12 @@ def train_network(resume_model_path=None):
                     )
                     loss_track = (speed_sample_weight * loss_track_raw).mean()
                     residual = delta_opt - delta_base
-                    residual_abs = torch.abs(residual).detach()
-                    residual_norm = residual_abs.mean().detach() + 1e-6
-                    focus_weight = 1.0 + float(TRAIN_CONFIG.get('COMP_FOCUS_GAMMA', 1.0)) * (residual_abs / residual_norm)
-                    sample_weight = speed_sample_weight * focus_weight
-                    loss_comp = (sample_weight * torch.abs(model_comp - residual)).mean()
-                    loss_under_comp = (speed_sample_weight * torch.relu(torch.abs(residual) - torch.abs(model_comp))).mean()
+                    loss_comp, loss_under_comp, loss_over_comp = _compute_compensation_balance_losses(
+                        model_comp,
+                        residual,
+                        speed_sample_weight,
+                        TRAIN_CONFIG,
+                    )
                     overflow_upper = torch.relu(delta_pred - steer_max)
                     overflow_lower = torch.relu(steer_min - delta_pred)
                     loss_limit = (overflow_upper + overflow_lower).mean()
@@ -2469,6 +2471,7 @@ def train_network(resume_model_path=None):
                         + TRAIN_CONFIG['RATE_LOSS_WEIGHT'] * loss_rate
                         + TRAIN_CONFIG.get('COMP_LOSS_WEIGHT', 0.0) * loss_comp
                         + TRAIN_CONFIG.get('UNDER_COMP_LOSS_WEIGHT', 0.0) * loss_under_comp
+                        + TRAIN_CONFIG.get('OVER_COMP_LOSS_WEIGHT', 0.0) * loss_over_comp
                     )
 
                 total_val_loss += loss.item() * len(e)
@@ -2687,6 +2690,7 @@ class AdaptiveLQRController:
             mode_a_alpha_range=self.config.get('MODE_A_ALPHA_RANGE', (0.5, 1.5)),
             mode_a_beta_scale=self.config.get('MODE_A_BETA_SCALE', 0.1),
             mode_d_delta_scale=self.config.get('MODE_D_DELTA_SCALE', 0.1),
+            mode_d_use_tanh_bound=self.config.get('MODE_D_USE_TANH_BOUND', False),
             speed_feature_gain=self.config.get('SPEED_FEATURE_GAIN', 1.8)
         ).to(self.device)
         # 使用 weights_only=True 只加载 tensor 权重，避免 pickle 反序列化风险
@@ -3278,6 +3282,7 @@ def evaluate_selected_model_prediction_performance(model_dir, model_files, resol
         mode_a_alpha_range=saved_config.get('MODE_A_ALPHA_RANGE', (0.5, 1.5)),
         mode_a_beta_scale=saved_config.get('MODE_A_BETA_SCALE', 0.1),
         mode_d_delta_scale=saved_config.get('MODE_D_DELTA_SCALE', 0.1),
+        mode_d_use_tanh_bound=saved_config.get('MODE_D_USE_TANH_BOUND', False),
         speed_feature_gain=saved_config.get('SPEED_FEATURE_GAIN', 1.8)
     )
     _load_adaptive_network_state(
@@ -3564,6 +3569,7 @@ def _export_diagnostics_for_specific_model(model_path, config_path, model_dir):
             mode_a_alpha_range=saved_config.get('MODE_A_ALPHA_RANGE', (0.5, 1.5)),
             mode_a_beta_scale=saved_config.get('MODE_A_BETA_SCALE', 0.1),
             mode_d_delta_scale=saved_config.get('MODE_D_DELTA_SCALE', 0.1),
+            mode_d_use_tanh_bound=saved_config.get('MODE_D_USE_TANH_BOUND', False),
             speed_feature_gain=saved_config.get('SPEED_FEATURE_GAIN', 1.8)
         )
         _load_adaptive_network_state(
